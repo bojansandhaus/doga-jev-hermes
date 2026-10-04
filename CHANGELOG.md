@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.4.0 (2026-10-04)
+
+### Added
+- Cloudflare Clef as a fourth response-contract route, `clef_api`, alongside `jev_api`, `laya_local`, and `laya_with_jev_fallback`. Select `/doga mode clef_api` in the current process or set `DOGA_DECISION_MODE=clef_api` at startup; the legacy `/doga provider clef` alias also works.
+- Clef is called on Cloudflare Workers AI's account endpoint, `POST https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/cloudflare/clef`, in one call per request. No Cloudflare Worker, GPU, or self-hosted deployment is needed, because Cloudflare serves the model. Serving it yourself from Cloudflare's published Apache 2.0 weights is possible and deliberately out of scope for this release.
+- Two required environment values: `CLOUDFLARE_ACCOUNT_ID`, which selects the account and is configuration rather than a secret, and `CLOUDFLARE_API_TOKEN`, a bearer token with the Account > Workers AI > Read permission. Both are checked before any request, and the error names the missing variable.
+- `DOGA_CLEF_MODEL` selects the checkpoint, `clef` (27B, the default) or `clef-flash` (9B). An unknown value fails rather than silently calling a checkpoint that does not exist.
+- `tests/test_clef_integration.py` covers the route in 19 tests: Cloudflare as the only destination, both response envelopes, Cloudflare error codes, missing-credential failures before any socket work, the flash checkpoint, typed answer validation, contract injection through the real hook, and log hygiene.
+
+### Changed
+- Both `clef` and `clef-flash` response shapes are accepted, the bare model output and Cloudflare's `success`/`result` REST envelope, preferring top-level answers. A `success: false` envelope raises with Cloudflare's own numeric error codes instead of a generic parse failure.
+- Clef answers are validated against the same criteria Jev's are: every question must be answered, a `choice` must be one of that question's allowed options, and a `noul` probability must be within 0 to 1.
+- Status and help list the fourth mode, and the README documents the checkpoint choice, both required environment values, the privacy boundary, the billing model, and the failure behaviour.
+- Two Laya tests that read the legacy provider environment variable now unset `DOGA_DECISION_MODE` first. They were relying on the caller's environment not already setting the newer, higher-precedence variable, which made them fail on any machine where DOGA is configured. One Laya test's help-text assertion was widened to the new provider list.
+
+### Deliberate limits
+- Clef has no fallback route. A Clef failure leaves DOGA on its ordinary guidance and never reaches Jev or Laya, and Clef is not wired into the Laya error fallback, which stays Jev-only. A classifier failure is not treated as permission to silently ask a different classifier.
+- The 0.7 ambiguity threshold is shared across all three classifiers and has not been calibrated between them. Clef's agreement with authored labels has not been measured at all.
+- Live Clef verification was not performed. No Cloudflare credential available on the release machine is authorized for Workers AI, so every candidate token returned HTTP 401 from `api.cloudflare.com`. All Clef tests use mocked responses. The wire format follows Cloudflare's published model documentation; treat the first real call as unverified until one succeeds.
+- Selecting `clef_api` sends every classified request to Cloudflare, which bills Workers AI usage. Jev and Clef are both remote; only `laya_local` and a healthy `laya_with_jev_fallback` keep classification local.
+
+### Verification
+- `python -m pytest tests -q` reports 172 passed, run both with and without `DOGA_DECISION_MODE` set in the environment. Wheel and source distribution build. The installed plugin was not reloaded and the running gateway was not restarted, so the gateway still uses the v1.3.0 configuration.
+
+---
+
 ## v1.3.0 (2026-09-26)
 
 ### Added

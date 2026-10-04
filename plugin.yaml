@@ -1,5 +1,5 @@
 name: doga
-version: "1.3.0"
+version: "1.4.0"
 description: "Probabilistic, goal-aware thinking layer for Hermes Agent"
 author: "0z1-ghb"
 license: MIT

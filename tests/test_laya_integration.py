@@ -84,16 +84,20 @@ def test_doga_can_select_local_provider_without_disabling_contract(monkeypatch):
 def test_invalid_provider_is_rejected_without_mutating_setting(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "jev")
     message = plugin._handle_doga("provider something-else")
-    assert "jev|laya" in message
+    assert "jev|clef|laya" in message
     assert plugin._state.decision_provider == "jev"
 
 
 def test_process_startup_reads_local_provider_selection(monkeypatch):
+    # DOGA_DECISION_MODE takes precedence over the legacy provider variable, so
+    # an ambient value in the caller's environment would silently win here.
+    monkeypatch.delenv("DOGA_DECISION_MODE", raising=False)
     monkeypatch.setenv("DOGA_DECISION_PROVIDER", "laya")
     assert plugin._PluginState().decision_provider == "laya"
 
 
 def test_invalid_startup_provider_does_not_fall_through_to_remote(monkeypatch):
+    monkeypatch.delenv("DOGA_DECISION_MODE", raising=False)
     monkeypatch.setenv("DOGA_DECISION_PROVIDER", "unknown")
     provider = plugin._PluginState().decision_provider
     with patch.object(response_contract, "_request_jev", side_effect=AssertionError("remote call")):

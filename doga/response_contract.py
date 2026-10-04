@@ -1,4 +1,18 @@
-"""Jev or local Laya request classification and DOGA response contracts."""
+"""Jev, Cloudflare Clef, or local Laya classification and DOGA contracts.
+
+Three decision engines share one contract. Each route is a replacement for the
+others rather than a member of a chain they all sit in:
+
+- ``jev`` is hosted, through OpenRouter first and direct TypeSafe second.
+- ``clef`` is hosted at Cloudflare Workers AI and needs an account ID plus an
+  API token with the Workers AI read permission. The account ID is
+  configuration, the token is a credential; neither is read from DOGA config.
+- ``laya`` runs in the Hermes process with no credential and no network egress.
+
+Clef and Jev are both remote, so selecting either one sends the request off the
+machine. Selecting Laya does not. Only the explicit Laya-with-Jev-fallback route
+adds a second call, and only when the local attempt raises.
+"""
 from __future__ import annotations
 
 import json
@@ -14,6 +28,17 @@ MODEL = "jev-latest"
 OPENROUTER_API_URL = "https://openrouter.ai/api/alpha/decisions"
 OPENROUTER_MODEL = "typesafe/jev-1.13"
 LAYA_MODEL = "convaiinnovations/laya"
+# Clef is Cloudflare-hosted. The endpoint is per account, so the account ID is a
+# required part of the URL rather than an optional setting.
+CLEF_RUN_PATH = "/ai/run/@cf/cloudflare/{model}"
+CLEF_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
+CLEF_DEFAULT_MODEL = "clef"
+CLEF_MODELS = ("clef", "clef-flash")
+CLEF_ACCOUNT_ENV = "CLOUDFLARE_ACCOUNT_ID"
+CLEF_TOKEN_ENV = "CLOUDFLARE_API_TOKEN"
+CLEF_MODEL_ENV = "DOGA_CLEF_MODEL"
+CLEF_TIMEOUT = 15.0
+PROVIDERS = ("jev", "clef", "laya")
 logger = logging.getLogger(__name__)
 _laya_lock = threading.RLock()
 _laya_failure_lock = threading.Lock()
@@ -124,6 +149,84 @@ def _request_laya(state: dict[str, Any], questions: dict[str, Any]) -> dict[str,
     return result
 
 
+def _clef_checkpoint() -> str:
+    """The Clef checkpoint to call: the 27B ``clef`` by default, or ``clef-flash``.
+
+    Clef Flash is the 9B variant Cloudflare documents for latency-bound paths.
+    Both answer the same System One shaped typed questions, so it is a setting
+    rather than a separate provider. An unknown value fails instead of silently
+    calling a checkpoint that does not exist.
+    """
+    model = (os.environ.get(CLEF_MODEL_ENV) or CLEF_DEFAULT_MODEL).strip().lower()
+    if model not in CLEF_MODELS:
+        raise RuntimeError(f"{CLEF_MODEL_ENV} must be one of: {', '.join(CLEF_MODELS)}")
+    return model
+
+
+def _request_clef(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
+    """Call Cloudflare Workers AI once. Never falls back to another provider.
+
+    Both credentials are checked before any socket work, and the error names the
+    missing variable rather than the value, so a misconfigured route fails on the
+    first request instead of degrading into another classifier.
+    """
+    account = (os.environ.get(CLEF_ACCOUNT_ENV) or "").strip()
+    token = (os.environ.get(CLEF_TOKEN_ENV) or "").strip()
+    if not account:
+        raise RuntimeError(f"Clef is selected but {CLEF_ACCOUNT_ENV} is not set")
+    if not token:
+        raise RuntimeError(f"Clef is selected but {CLEF_TOKEN_ENV} is not set")
+    model = _clef_checkpoint()
+    url = f"{CLEF_API_BASE}/{account}{CLEF_RUN_PATH.format(model=model)}"
+    payload = json.dumps({"model": model, "state": state, "questions": questions}).encode()
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=CLEF_TIMEOUT) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Cloudflare Workers AI returned HTTP {exc.code}") from exc
+    return _clef_result(data)
+
+
+def _clef_result(data: Any) -> dict[str, Any]:
+    """Unwrap a Clef response and validate its typed answers.
+
+    Cloudflare serves Clef from a REST endpoint that answers with the model
+    output directly, while its general API surface wraps results in a
+    ``success``/``result`` envelope. Both are accepted, top level answers first.
+    A ``success: false`` envelope carries Cloudflare's own error codes, which are
+    more useful than a generic parse failure, so they are surfaced as they are.
+    """
+    if not isinstance(data, dict):
+        raise RuntimeError("Cloudflare Workers AI returned an invalid response")
+    if data.get("success") is False:
+        codes = [str(error.get("code")) for error in (data.get("errors") or []) if isinstance(error, dict)]
+        detail = ", ".join(codes) if codes else "unknown error"
+        raise RuntimeError(f"Cloudflare Workers AI request failed (code {detail})")
+    answers = data.get("answers")
+    if not isinstance(answers, dict):
+        inner = data.get("result")
+        answers = inner.get("answers") if isinstance(inner, dict) else None
+    if not isinstance(answers, dict):
+        raise RuntimeError("Cloudflare Workers AI returned an invalid response")
+    for name, question in QUESTIONS.items():
+        answer = answers.get(name)
+        if not isinstance(answer, dict):
+            raise RuntimeError(f"invalid Clef response: missing typed answer for {name!r}")
+        if question["type"] == "choice" and answer.get("choice") not in question["criteria"]:
+            raise RuntimeError(f"invalid Clef response: unknown choice for {name!r}")
+        if question["type"] == "noul":
+            score = answer.get("noul")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+                raise RuntimeError(f"invalid Clef response: invalid probability for {name!r}")
+    return {**data, "answers": answers, "_doga_provider": "clef"}
+
+
 def evaluate_contract(
     user_message: str,
     evaluator: Callable[..., dict[str, Any]] | None = None,
@@ -131,9 +234,14 @@ def evaluate_contract(
     fallback_to_jev: bool = False,
 ) -> dict[str, Any]:
     """Ask independent typed judgments in one call over the request only."""
-    if provider not in {"jev", "laya"}:
-        raise ValueError("DOGA decision provider must be jev or laya")
+    if provider not in PROVIDERS:
+        raise ValueError(f"DOGA decision provider must be one of: {', '.join(PROVIDERS)}")
     state = {"user_request": user_message}
+    if provider == "clef" and evaluator is None:
+        # Clef is a hosted route of its own. A Clef failure is a failure of this
+        # route, not a licence to call a second classifier, so there is no
+        # fallback branch here at all.
+        return _request_clef(state=state, questions=QUESTIONS)
     if provider == "laya" and fallback_to_jev and evaluator is None:
         global _laya_failure_count
         try:

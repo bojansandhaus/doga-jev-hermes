@@ -66,6 +66,7 @@ class _PluginState:
         if startup_mode:
             self.decision_provider, self.jev_fallback = {
                 "jev_api": ("jev", False),
+                "clef_api": ("clef", False),
                 "laya_local": ("laya", False),
                 "laya_with_jev_fallback": ("laya", True),
             }.get(startup_mode, (startup_mode, False))
@@ -139,6 +140,8 @@ class _PluginState:
     def decision_mode(self) -> str:
         if self.decision_provider == "jev":
             return "jev_api"
+        if self.decision_provider == "clef":
+            return "clef_api"
         if self.decision_provider == "laya":
             return "laya_with_jev_fallback" if self.jev_fallback else "laya_local"
         return f"invalid ({self.decision_provider})"
@@ -508,8 +511,8 @@ Subcommands:
   memory on           Enable Mnemosyne goal memory (requires pip install mnemosyne-memory)
   memory off          Disable Mnemosyne goal memory
   jev on|off          Legacy alias: enable or disable response contracts
-  mode jev_api|laya_local|laya_with_jev_fallback  Select one classifier route
-  provider jev|laya   Legacy alias: select Jev or local-only Laya
+  mode jev_api|clef_api|laya_local|laya_with_jev_fallback  Select one classifier route
+  provider jev|clef|laya   Legacy alias: select Jev, Cloudflare Clef, or local-only Laya
   fallback on|off     Legacy alias: change the Laya error fallback
 
 Current state: {state}
@@ -615,18 +618,19 @@ def _handle_doga(raw_args: str) -> Optional[str]:
     if sub == "mode":
         modes = {
             "jev_api": ("jev", False),
+            "clef_api": ("clef", False),
             "laya_local": ("laya", False),
             "laya_with_jev_fallback": ("laya", True),
         }
         if len(argv) != 2 or argv[1].lower() not in modes:
-            return "Usage: /doga mode jev_api|laya_local|laya_with_jev_fallback"
+            return "Usage: /doga mode jev_api|clef_api|laya_local|laya_with_jev_fallback"
         _state.decision_provider, _state.jev_fallback = modes[argv[1].lower()]
         _state._last_jev_status = "enabled"
         return f"DOGA response contract mode: {_state.decision_mode}."
 
     if sub == "provider":
-        if len(argv) != 2 or argv[1].lower() not in {"jev", "laya"}:
-            return "Usage: /doga provider jev|laya"
+        if len(argv) != 2 or argv[1].lower() not in {"jev", "clef", "laya"}:
+            return "Usage: /doga provider jev|clef|laya"
         _state.decision_provider = argv[1].lower()
         _state.jev_fallback = False
         _state._last_jev_status = "enabled"
