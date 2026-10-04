@@ -3,7 +3,7 @@
 ## v1.4.1 (2026-10-04)
 
 ### Added
-- The README records this repository's GitHub topic tags so the tags and the documentation agree: `cloudflare`, `clef`, `laya`, `kev`, `tev1`, `system-one`, `decision-model`.
+- The README records this repository's GitHub topic tags so the tags and the documentation agree: `clef`, `cloudflare`, `jev`, `laya`, `system-one`, `decision-model`.
 - `DOGA_LOCAL_MODEL` selects which local System One decision model answers, replacing a hard-coded binding to one engine. It defaults to `convaiinnovations/laya`, so the default path is byte-for-byte unchanged, and it is the checkpoint name sent to the local server. Switching engines is a configuration change: there is no new provider name and no code change. The value is **not** checked against an allowlist, because a new local model must work by configuration alone; only a value that could not be used safely is rejected, namely an empty or whitespace-only value, a value containing whitespace, quotes, a backslash, a control character, or a URL separator, and a `.` or `..` path segment. An unset variable takes the default, while a variable that is set but empty is an error rather than a silent default.
 - `tests/test_modes.py` covers the mode contract and the local slot in 134 tests: the four canonical modes and their provider orders, every alias in the table below including its routing decision, that no alias reaches observable output, per-mode call and non-reroute behaviour, `local_model` selecting the engine with the default unchanged, rejected values, engine reload on a name change, single load per name, and log hygiene on a chain failure.
 
@@ -32,7 +32,7 @@
 - No release candidate was cut; this is the next minor version, as agreed for these repositories.
 
 ### Verification
-- `python -m pytest tests -q` reports **307 passed**, up from 172. The suite was also run with `DOGA_DECISION_MODE` set to `local_with_api_fallback`, `clef_api`, and `api_only`, and with `DOGA_LOCAL_MODEL` set to `kev` and `tev1`, and reported 307 passed in every case. Each test file also passes in isolation.
+- `python -m pytest tests -q` reports **307 passed**, up from 172. The suite was also run with `DOGA_DECISION_MODE` set to `local_with_api_fallback`, `clef_api`, and `api_only`, and reported 307 passed in every case. Each test file also passes in isolation.
 - **No live call was made to any provider as part of this work.** Every test uses a fake module object, a monkeypatched function, or a socket fixture that fails loudly. No local model other than the default has been called live, and no credential available on this machine is authorized for Cloudflare Workers AI, so the standing limitation from v1.4.0 is unchanged: all Clef behaviour is mocked and the first real call should be treated as unverified. The only verified live behaviour remains what the earlier changelog entries record.
 
 ---

@@ -20,15 +20,11 @@ for each rather than prose. Jev is one vendor's member of the category, not the
 category, so the docs never write "Jev-like model" as the category name.
 
 Members named in the README: **Jev** (TypeSafe or OpenRouter, closed weights),
-**Clef** and **Clef Flash** (Cloudflare Workers AI), **Laya** (local, open
-weights, the default), **Kev** (open weights, 0.8B to 27B on Qwen3.5 and Qwen3.8
-bases, serving the same `/v1/systemone` request shape as TypeSafe's API), and
-named in the ecosystem index at [systemonemodels.org](https://systemonemodels.org/).
-
-Other members catalogued in the same index: **CLM** and **GLiNER2.5-Decide** (open weights), plus hosted **d1** (Liquid AI), **Mercury Decide** (Inception, free on OpenRouter), **Solar Decide** (Upstage), **pplx-decider** (Perplexity), **Span-01** (Respan), **Decider 1** (meraGPT), and the **OpenAI Decisions API**.
+**Clef** and **Clef Flash** (Cloudflare Workers AI), and **Laya** (local, open
+weights, the default). The local route is Laya or other pre-deterministic routing models. The category is catalogued at [systemonemodels.org](https://systemonemodels.org/).
 
 This release also records the repository's GitHub topic tags, so the tags and the
-documentation agree: `cloudflare`, `clef`, `laya`, `kev`, `tev1`, `system-one`,
+documentation agree: `clef`, `cloudflare`, `jev`, `laya`, `system-one`,
 `decision-model`.
 
 This is a documentation change only. No mode, setting, provider route, help
@@ -72,14 +68,11 @@ set but empty is an error rather than a silent default.
 
 System One decision models documented as speaking the same `/v1/systemone`
 contract and therefore fitting the slot: `laya` (also `laya-multilingual` and
-`laya-typed-decisions`), `kev` (also `kev-0.8b`, 0.8B to 27B on Qwen3.5 and
-Qwen3.8 bases), `tev1` (`Tev1-4B` and `Tev1-0.8B`), and `jeff-qwen3.5-0.8b` and
-`jeff-gemma4-e2b`. Those membership and wire-contract claims come from each
+`laya-typed-decisions`), or any other local engine that speaks the same contract. Those membership and wire-contract claims come from each
 project's own documentation; nothing in this list was confirmed by calling it
 here. See [chaitin/Decis](https://github.com/chaitin/Decis) for the
 interchangeable-engine reference, one Docker image per engine with `base_url` as
-the whole migration, and [togethercomputer/tev1](https://github.com/togethercomputer/tev1)
-for Tev1.
+the whole migration. Any of Laya or other pre-deterministic routing models can occupy the slot that way.
 
 ## What stayed compatible
 
@@ -118,9 +111,8 @@ single source of truth.
 
 `python -m pytest tests -q` reports **307 passed**, up from 172 on v1.4.0. The
 suite was additionally run with `DOGA_DECISION_MODE` set to
-`local_with_api_fallback`, `clef_api`, and `api_only`, and with
-`DOGA_LOCAL_MODEL` set to `kev` and `tev1`; it reported 307 passed in every one
-of those runs. Each test file also passes in isolation. `git diff --check` is
+`local_with_api_fallback`, `clef_api`, and `api_only`; it reported 307 passed in
+every one of those runs. Each test file also passes in isolation. `git diff --check` is
 clean.
 
 **No live call was made to any provider for this release.** No local model other

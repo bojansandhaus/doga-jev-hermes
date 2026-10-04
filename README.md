@@ -42,15 +42,13 @@ Members worth naming:
 | --- | --- | --- | --- |
 | **Jev** | TypeSafe, or through OpenRouter | closed | DOGA's default hosted side, model `typesafe/jev-1.13` |
 | **Clef**, **Clef Flash** | Cloudflare Workers AI | closed as served, Apache 2.0 weights published | `clef` 27B and `clef-flash` 9B; the second hosted side |
-| **Laya** | local, runs in the Hermes process | open | Convai Innovations. The local slot's default |
-| **Kev** | local or any host | open | 0.8B to 27B on Qwen3.5 and Qwen3.8 bases; serves the same `/v1/systemone` request shape as TypeSafe's API |
-| **Tev1** | Together AI | open | Qwen3.5-based; `Tev1-4B` and `Tev1-0.8B` checkpoints |
+| **Laya** | local, runs in the Hermes process | open | Convai Innovations. The local slot's default, which also accepts Laya or other pre-deterministic routing models |
 
 Honest limit: membership of the category and the shared wire contract are documented claims from those projects, not measurements made here. Nothing below was confirmed by calling a provider, apart from the two live behaviours this repository has already recorded in its changelog: local Laya inference with a cached checkpoint, and one Jev request made under a key that has since been removed.
 
 ### Repository topic tags
 
-This repository carries these GitHub topics, so the tags and this documentation name the same taxonomy: `cloudflare`, `clef`, `laya`, `kev`, `tev1`, `system-one`, `decision-model`, alongside its existing `doga`, `hermes-agent`, `jev`, `monte-carlo`, `openrouter`, `probabilistic-reasoning`, and `typesafe` topics.
+This repository carries these GitHub topics, so the tags and this documentation name the same taxonomy: `clef`, `cloudflare`, `jev`, `laya`, `system-one`, `decision-model`, alongside its existing `doga`, `hermes-agent`, `jev`, `monte-carlo`, `openrouter`, `probabilistic-reasoning`, and `typesafe` topics.
 
 ---
 
@@ -128,7 +126,6 @@ uv pip install --python /path/to/hermes-python '.[laya]'
 # Select /doga mode local_only for this process, or set
 # DOGA_DECISION_MODE=local_only in Hermes' startup environment.
 # Then choose the engine, for example:
-# DOGA_LOCAL_MODEL=kev
 ```
 
 If you copied the plugin directory instead of installing the Python package, install `laya>=0.3.20,<1` into Hermes' Python environment. The optional dependency brings PyTorch and Transformers; allow disk space for them and the model checkpoint. The default engine is `convaiinnovations/laya`, loaded once per process and reused; switching `DOGA_LOCAL_MODEL` loads the newly named engine rather than reusing the previous one. Its first load can download weights from Hugging Face and block the first classified request while doing so. Cache the checkpoint before using `HF_HUB_OFFLINE=1` for offline operation. A local smoke test emitted a Laya warning about invalid saved choice temperatures that it clamped; treat affected confidence values as uncalibrated. No Jev keys are needed for `local_only`.
@@ -137,12 +134,9 @@ If you copied the plugin directory instead of installing the Python package, ins
 
 | Engine | Note |
 | --- | --- |
-| `laya` | Convai Innovations. Also `laya-multilingual` and `laya-typed-decisions`. The default |
-| `kev` | Open weights, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases, also published as `kev-0.8b`. Serves the same `/v1/systemone` request shape as TypeSafe's API |
-| `tev1` | Together AI, Qwen3.5-based, open weights. `Tev1-4B` and `Tev1-0.8B` checkpoints |
-| `jeff-qwen3.5-0.8b`, `jeff-gemma4-e2b` | |
+| `laya` | Convai Innovations. Also `laya-multilingual` and `laya-typed-decisions`. The default. Any of Laya or other pre-deterministic routing models can occupy the slot |
 
-Listing an engine here is a documented claim from its own project that it speaks the shared contract; it is not a measurement made in this repository. For the interchangeable-engine claim, see [chaitin/Decis](https://github.com/chaitin/Decis), which is self-hosted, serves the shared `/v1/systemone` contract that Jev's TypeSafe route also uses, and ships one Docker image per engine, so swapping `base_url` is the whole migration. For Tev1, see [togethercomputer/tev1](https://github.com/togethercomputer/tev1). A local server URL remains its own setting; pointing DOGA at a different engine's server is a configuration change, not a code change. An unrecognised mode name fails closed to ordinary guidance rather than reaching for the API.
+Listing an engine here is a documented claim from its own project that it speaks the shared contract; it is not a measurement made in this repository. For the interchangeable-engine claim, see [chaitin/Decis](https://github.com/chaitin/Decis), which is self-hosted, serves the shared `/v1/systemone` contract that Jev's TypeSafe route also uses, and ships one Docker image per engine, so swapping `base_url` is the whole migration. Any of Laya or other pre-deterministic routing models can occupy the slot that way. A local server URL remains its own setting; pointing DOGA at a different engine's server is a configuration change, not a code change. An unrecognised mode name fails closed to ordinary guidance rather than reaching for the API.
 
 ### Cloudflare Clef setup
 
