@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.4.1 (2026-10-04)
+
+### Added
+- The README records this repository's GitHub topic tags so the tags and the documentation agree: `cloudflare`, `clef`, `laya`, `kev`, `tev1`, `system-one`, `decision-model`.
+- `DOGA_LOCAL_MODEL` selects which local System One decision model answers, replacing a hard-coded binding to one engine. It defaults to `convaiinnovations/laya`, so the default path is byte-for-byte unchanged, and it is the checkpoint name sent to the local server. Switching engines is a configuration change: there is no new provider name and no code change. The value is **not** checked against an allowlist, because a new local model must work by configuration alone; only a value that could not be used safely is rejected, namely an empty or whitespace-only value, a value containing whitespace, quotes, a backslash, a control character, or a URL separator, and a `.` or `..` path segment. An unset variable takes the default, while a variable that is set but empty is an error rather than a silent default.
+- `tests/test_modes.py` covers the mode contract and the local slot in 134 tests: the four canonical modes and their provider orders, every alias in the table below including its routing decision, that no alias reaches observable output, per-mode call and non-reroute behaviour, `local_model` selecting the engine with the default unchanged, rejected values, engine reload on a name change, single load per name, and log hygiene on a chain failure.
+
+### Changed
+- The mode vocabulary is now four canonical names that say which side leads and whether the other is behind it: `api_with_local_fallback`, `api_only`, `local_only`, and `local_with_api_fallback`. `api_only` and `local_only` are single-provider routes whose failures are reported and never rerouted; the two fallback modes are two-provider chains that use the existing cooldown, trigger, and breaker machinery unchanged.
+- Mode resolution moved to a single table in `doga.response_contract`, exposed as `resolve_mode`. An alias resolves to its canonical name before it reaches a chain, a log line, a status line, or a URL, so no alias string is observable. Names stay case-insensitive, and an unknown name raises an error naming every accepted spelling.
+- The plugin's mode state is derived from the resolved mode rather than stored as a separate provider plus flag, so the two can no longer disagree. `decision_provider` and `jev_fallback` are kept as properties and still mean what they meant, including for direct assignment.
+- Help text, the `/doga mode` usage error, the registered command's `args_hint`, `/doga status`, and the failure log line all name the four canonical modes and the full alias list. `/doga status` also reports the configured local engine.
+- The local error messages name the slot rather than one engine, and the chain log line says "hosted fallback" rather than "Jev fallback", because the hosted side is configurable.
+
+### Kept working
+- Every mode name this plugin has accepted before still selects the same routing decision: `auto` resolves to `api_with_local_fallback` when a usable local model is present and `api_only` otherwise; `jev_api`, `typesafe`, and `openrouter` resolve to `api_only` on Jev; `clef_api` and `clef` resolve to `api_only` on Clef; `laya` and `laya_local` resolve to `local_only`; `laya_then_hosted` and `laya_with_jev_fallback` resolve to `local_with_api_fallback`. `clef_with_local_fallback` was added as an alias for `api_with_local_fallback` on Clef. The bare `DOGA_DECISION_PROVIDER` values `jev`, `clef`, and `laya` keep working on their own.
+- `DOGA_DECISION_MODE` still takes precedence over `DOGA_DECISION_PROVIDER` and `DOGA_LAYA_JEV_FALLBACK`, and the default configuration is still Jev with no fallback, which is now named `api_only`. The legacy `/doga provider jev|clef|laya`, `/doga fallback on|off`, and `/doga jev on|off` commands all still work, and selecting a legacy provider still resets the fallback.
+- A hosted failure is still never rerouted to a *different* hosted provider: `api_with_local_fallback` tries the hosted route and then the local slot, never Jev on top of Clef. Clef is still not wired into the local error fallback.
+- The per-model Clef checkpoint setting `DOGA_CLEF_MODEL`, its two allowed values, the Cloudflare endpoint, and both Clef credential checks are untouched.
+
+### Tests updated, and why
+- Existing assertions that named a mode string in status, help, or a command reply now assert the canonical name the alias denotes, because an alias must not reach observable output. Each of those tests still asserts the alias was accepted and that the correct provider leads, so the compatibility claim is still covered rather than dropped.
+- Three call-shape assertions on `evaluate_contract` gained the new `mode` and `hosted` arguments. The mode is passed rather than inferred because the legacy provider plus fallback pair cannot express `api_with_local_fallback`: both API-led modes lead with the same provider and differ only in what sits behind them.
+- The Laya test fixture now also clears `DOGA_LOCAL_MODEL`, since the engine name is read from the environment on every call. Without that, an ambient value changed which engine those tests loaded. This is the same class of trap fixed for `DOGA_DECISION_MODE` in v1.4.0.
+
+### Deliberate limits
+- `local_model` is a new setting and no existing setting was removed or had its meaning changed. It never appears in a fallback order and is never a mode alias.
+- Naming the category was a documentation-only change. No mode, setting, provider route, help string, or resolution rule changed with it, so the test count is unchanged at 307.
+- Membership of the System One decision model category and the shared `/v1/systemone` wire contract are documented claims from those projects, not measurements made here. No live call was made to any provider, and no local model other than the default has been called live.
+- No release candidate was cut; this is the next minor version, as agreed for these repositories.
+
+### Verification
+- `python -m pytest tests -q` reports **307 passed**, up from 172. The suite was also run with `DOGA_DECISION_MODE` set to `local_with_api_fallback`, `clef_api`, and `api_only`, and with `DOGA_LOCAL_MODEL` set to `kev` and `tev1`, and reported 307 passed in every case. Each test file also passes in isolation.
+- **No live call was made to any provider as part of this work.** Every test uses a fake module object, a monkeypatched function, or a socket fixture that fails loudly. No local model other than the default has been called live, and no credential available on this machine is authorized for Cloudflare Workers AI, so the standing limitation from v1.4.0 is unchanged: all Clef behaviour is mocked and the first real call should be treated as unverified. The only verified live behaviour remains what the earlier changelog entries record.
+
+---
+
 ## v1.4.0 (2026-10-04)
 
 ### Added

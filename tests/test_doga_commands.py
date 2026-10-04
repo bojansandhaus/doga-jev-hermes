@@ -1,6 +1,7 @@
 """Tests for /doga slash commands."""
 import pytest
 import doga.__init__ as plugin
+from doga import response_contract
 
 
 @pytest.fixture(autouse=True)
@@ -198,29 +199,52 @@ def test_jev_on_and_off(monkeypatch):
     assert plugin._state.jev_enabled is False
 
 
-def test_three_modes_switch_atomically_and_report_effective_choice(monkeypatch):
+def test_four_canonical_modes_switch_atomically_and_report_effective_choice(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "jev")
+    monkeypatch.setattr(plugin._state, "_hosted", "jev")
     monkeypatch.setattr(plugin._state, "jev_fallback", False)
-    for mode, provider, fallback in (
-        ("laya_with_jev_fallback", "laya", True),
-        ("jev_api", "jev", False),
-        ("laya_local", "laya", False),
+    # Each canonical mode, the provider that leads, and the order the hook
+    # would route it in. The provider pair is not asserted for the API-led
+    # fallback mode: both API-led modes lead with the same provider, so the
+    # mode is the only thing that distinguishes them and it is asserted here.
+    for mode, provider, order in (
+        ("local_with_api_fallback", "laya", ("laya", "jev")),
+        ("api_only", "jev", ("jev",)),
+        ("local_only", "laya", ("laya",)),
+        ("api_with_local_fallback", "jev", ("jev", "laya")),
     ):
         assert mode in plugin._handle_doga(f"mode {mode}")
-        assert (plugin._state.decision_provider, plugin._state.jev_fallback) == (provider, fallback)
+        assert plugin._state.decision_provider == provider
         assert mode in plugin._handle_doga("status")
         assert mode == plugin._state.to_dict()["decision_mode"]
+        resolved = response_contract.resolve_mode(mode, hosted=plugin._state._hosted)
+        assert resolved.providers == order
+
+
+def test_legacy_mode_aliases_are_reported_as_canonical_names(monkeypatch):
+    """An alias selects the mode it denotes, and never reaches output."""
+    monkeypatch.setattr(plugin._state, "decision_provider", "jev")
+    monkeypatch.setattr(plugin._state, "jev_fallback", False)
+    for alias, canonical in (
+        ("jev_api", "api_only"),
+        ("laya_local", "local_only"),
+        ("laya_with_jev_fallback", "local_with_api_fallback"),
+    ):
+        message = plugin._handle_doga(f"mode {alias}")
+        assert canonical in message
+        assert alias not in message
+        assert plugin._state.decision_mode == canonical
 
 
 def test_legacy_provider_and_fallback_do_not_leave_hidden_remote_route(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "laya")
     monkeypatch.setattr(plugin._state, "jev_fallback", True)
     plugin._handle_doga("provider jev")
-    assert plugin._state.decision_mode == "jev_api"
-    assert "only available with Laya" in plugin._handle_doga("fallback on")
+    assert plugin._state.decision_mode == "api_only"
+    assert "only available with the local model" in plugin._handle_doga("fallback on")
     assert plugin._state.jev_fallback is False
     plugin._handle_doga("provider laya")
-    assert plugin._state.decision_mode == "laya_local"
+    assert plugin._state.decision_mode == "local_only"
 
 
 def test_mode_startup_environment_wins_over_legacy_settings(monkeypatch):
@@ -230,7 +254,8 @@ def test_mode_startup_environment_wins_over_legacy_settings(monkeypatch):
     state = plugin._PluginState()
     assert state.decision_provider == "laya"
     assert state.jev_fallback is True
-    assert state.decision_mode == "laya_with_jev_fallback"
+    # The legacy alias is accepted, reported as the canonical mode it denotes.
+    assert state.decision_mode == "local_with_api_fallback"
 
 
 def test_invalid_mode_startup_fails_closed(monkeypatch):
@@ -243,9 +268,9 @@ def test_invalid_mode_command_preserves_state(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "jev")
     monkeypatch.setattr(plugin._state, "jev_fallback", False)
     assert "Usage" in plugin._handle_doga("mode unavailable")
-    assert plugin._state.decision_mode == "jev_api"
+    assert plugin._state.decision_mode == "api_only"
 
 
 def test_status_includes_selected_decision_provider():
     result = plugin._handle_doga("status")
-    assert result is not None and "Response contracts: enabled (mode: jev_api" in result
+    assert result is not None and "Response contracts: enabled (mode: api_only" in result

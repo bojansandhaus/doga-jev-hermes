@@ -60,21 +60,126 @@ class _PluginState:
         self.memory_enabled: bool = True
         self.jev_enabled: bool = True
         self._last_jev_status: str = "enabled"
-        self.decision_provider: str = os.environ.get("DOGA_DECISION_PROVIDER", "jev").strip().lower()
-        self.jev_fallback: bool = os.environ.get("DOGA_LAYA_JEV_FALLBACK", "0").strip().lower() in {"1", "true", "yes"}
-        startup_mode = os.environ.get("DOGA_DECISION_MODE", "").strip().lower()
-        if startup_mode:
-            self.decision_provider, self.jev_fallback = {
-                "jev_api": ("jev", False),
-                "clef_api": ("clef", False),
-                "laya_local": ("laya", False),
-                "laya_with_jev_fallback": ("laya", True),
-            }.get(startup_mode, (startup_mode, False))
-        elif self.decision_provider != "laya":
-            self.jev_fallback = False
+        self._mode: str = "api_only"
+        self._mode_valid: bool = True
+        self._fallback: bool = False
+        # Which hosted provider the API side resolves to. Kept beside the mode
+        # rather than inside it, because the legacy DOGA_DECISION_PROVIDER value
+        # names a provider and must keep working on its own.
+        self._hosted: str = "jev"
+        self._resolve_startup_mode()
         self.de_bono_enabled: bool = True
         self.max_recursion: int = 3
         self._local = threading.local()
+
+    def _resolve_startup_mode(self) -> None:
+        """Pick the startup mode from the environment, newest setting first.
+
+        ``DOGA_DECISION_MODE`` wins over the legacy ``DOGA_DECISION_PROVIDER``
+        and ``DOGA_LAYA_JEV_FALLBACK`` pair, exactly as it did before this
+        change. An unrecognised name is kept verbatim and reported as invalid
+        rather than being coerced into a mode that sends the request somewhere
+        nobody asked for, so a typo fails closed on the first request instead.
+        """
+        startup_mode = os.environ.get("DOGA_DECISION_MODE", "").strip()
+        if startup_mode:
+            self._apply_mode(startup_mode)
+            return
+        provider = os.environ.get("DOGA_DECISION_PROVIDER", "jev").strip().lower() or "jev"
+        fallback = os.environ.get("DOGA_LAYA_JEV_FALLBACK", "0").strip().lower() in {"1", "true", "yes"}
+        if provider in response_contract.PROVIDERS and provider != "laya":
+            self._hosted = provider
+        if provider != "laya":
+            fallback = False
+        self._apply_mode(provider, fallback=fallback)
+
+    def _apply_mode(self, name: str, *, fallback: bool | None = None, strict: bool = True) -> bool:
+        """Set provider and fallback from any accepted mode spelling.
+
+        Returns False and changes nothing when the name is not accepted, so a
+        rejected selection cannot leave a half-applied mode behind. An alias is
+        rewritten to its canonical name here, so no alias string reaches a log
+        line, a status line, or a provider call.
+
+        ``strict`` marks a name that came from configuration as invalid rather
+        than ignoring it. That distinction matters at startup, where a typo in
+        ``DOGA_DECISION_MODE`` has to surface as an invalid mode, while a
+        rejected ``/doga mode`` from a user must simply leave the current mode
+        untouched and be reported as a usage error.
+        """
+        try:
+            resolved = response_contract.resolve_mode(name, hosted=self._hosted)
+        except response_contract.ModeError:
+            if not strict:
+                return False
+            self._mode = str(name)
+            self._mode_valid = False
+            return False
+        if fallback is not None:
+            # An explicit fallback flag overrides what the spelling implied, so
+            # the legacy provider plus fallback pair lands on the mode that
+            # actually has that chain. Without this, ``provider=laya`` with the
+            # fallback flag set would report local_only while routing as a chain.
+            side_leads_local = resolved.providers[0] == response_contract.LOCAL_PROVIDER
+            if side_leads_local:
+                resolved = response_contract.resolve_mode(
+                    response_contract.LOCAL_WITH_API_FALLBACK if fallback
+                    else response_contract.LOCAL_ONLY, hosted=self._hosted)
+            else:
+                resolved = response_contract.resolve_mode(
+                    response_contract.API_WITH_LOCAL_FALLBACK if fallback
+                    else response_contract.API_ONLY, hosted=self._hosted)
+        self._mode = resolved.name
+        self._mode_valid = True
+        # Remember which hosted provider an API-led mode resolved to, so the
+        # next mode selection that does not pin one keeps that provider.
+        for provider in resolved.providers:
+            if provider in response_contract.HOSTED_PROVIDERS:
+                self._hosted = provider
+        if fallback is None:
+            fallback = len(resolved.providers) > 1 and resolved.fallback in response_contract.HOSTED_PROVIDERS
+        self._fallback = fallback
+        return True
+
+    @property
+    def decision_provider(self) -> str:
+        """The provider that leads, kept for backwards compatibility.
+
+        Derived from the resolved mode rather than stored separately, so the two
+        can never disagree. Assigning to it selects a mode, because the legacy
+        ``DOGA_DECISION_PROVIDER`` and ``/doga provider`` settings mean exactly
+        that.
+        """
+        if not self._mode_valid:
+            return "unknown"
+        return self._hosted if self._mode.startswith("api") else response_contract.LOCAL_PROVIDER
+
+    @decision_provider.setter
+    def decision_provider(self, value: str) -> None:
+        # A direct assignment is a legacy path, including from tests and older
+        # callers, so it selects a mode but never marks the state invalid.
+        self._apply_mode(str(value).strip().lower() or response_contract.DEFAULT_HOSTED,
+                         fallback=False, strict=False)
+
+    @property
+    def jev_fallback(self) -> bool:
+        """Whether the local side has the hosted API behind it."""
+        return self._fallback
+
+    @jev_fallback.setter
+    def jev_fallback(self, value: bool) -> None:
+        # Re-resolves the mode rather than only storing the flag, so assigning
+        # this alone cannot leave a mode that disagrees with the flag. Which
+        # side leads comes from the provider, which is preserved here: that is
+        # exactly what the legacy provider plus fallback pair means.
+        if not self._mode_valid:
+            self._fallback = bool(value)
+            return
+        current = self._mode
+        if self._apply_mode(current, fallback=bool(value), strict=False):
+            return
+        # An unusable current mode: keep the flag without touching it.
+        self._fallback = bool(value)
 
     @property
     def _current_user_message(self) -> str:
@@ -138,13 +243,21 @@ class _PluginState:
 
     @property
     def decision_mode(self) -> str:
-        if self.decision_provider == "jev":
-            return "jev_api"
-        if self.decision_provider == "clef":
-            return "clef_api"
-        if self.decision_provider == "laya":
-            return "laya_with_jev_fallback" if self.jev_fallback else "laya_local"
-        return f"invalid ({self.decision_provider})"
+        """The canonical mode name, or an explicit invalid marker.
+
+        Never an alias, because this string reaches ``/doga status``, the help
+        text, and the failure log line.
+        """
+        if not self._mode_valid:
+            return f"invalid ({self._mode})"
+        return self._mode
+
+    def local_model_name(self) -> str:
+        """The engine name the local slot would use, or why it cannot."""
+        try:
+            return response_contract.local_model()
+        except RuntimeError:
+            return "invalid"
 
     def to_dict(self) -> dict:
         mode = f"auto (complexity: {self._last_complexity})" if self.auto_depth else f"manual (depth: {self.depth})"
@@ -160,6 +273,7 @@ class _PluginState:
             "jev": "enabled" if self.jev_enabled else "disabled",
             "decision_mode": self.decision_mode,
             "decision_provider": self.decision_provider,
+            "local_model": self.local_model_name(),
             "jev_fallback": self.jev_fallback,
             "mnemosyne": "available" if MNEMOSYNE_AVAILABLE else "not installed",
         }
@@ -226,11 +340,22 @@ def _on_pre_llm_call(
     )
     if _state.jev_enabled and user_message:
         try:
-            judged = response_contract.evaluate_contract(user_message, provider=_state.decision_provider,
-                                                        fallback_to_jev=_state.jev_fallback)
+            # The canonical mode is passed rather than inferred from the legacy
+            # provider plus fallback pair, because that pair cannot express
+            # api_with_local_fallback: both API-led modes lead with the same
+            # provider and differ only in what sits behind it. An invalid mode
+            # passes None, which falls back to the legacy pair and then fails
+            # closed on the unknown provider.
+            judged = response_contract.evaluate_contract(
+                user_message,
+                provider=_state.decision_provider,
+                fallback_to_jev=_state.jev_fallback,
+                mode=_state._mode if _state._mode_valid else None,
+                hosted=_state._hosted if _state._mode_valid else None,
+            )
             contract = response_contract.build_contract(judged)
             guide += "\n\n" + response_contract.render_contract(contract)
-            _state._last_jev_status = "ok (jev fallback)" if judged.get("_doga_provider") == "jev_fallback" else "ok"
+            _state._last_jev_status = "ok (fallback)" if judged.get("_doga_provider", "").endswith("_fallback") else "ok"
         except Exception as exc:
             _state._last_jev_status = "error"
             logger.warning("DOGA %s contract failed (%s); using standard guidance", _state.decision_mode, type(exc).__name__)
@@ -511,12 +636,28 @@ Subcommands:
   memory on           Enable Mnemosyne goal memory (requires pip install mnemosyne-memory)
   memory off          Disable Mnemosyne goal memory
   jev on|off          Legacy alias: enable or disable response contracts
-  mode jev_api|clef_api|laya_local|laya_with_jev_fallback  Select one classifier route
-  provider jev|clef|laya   Legacy alias: select Jev, Cloudflare Clef, or local-only Laya
-  fallback on|off     Legacy alias: change the Laya error fallback
+  mode <mode>          Select one of the four response-contract modes below
+  provider jev|clef|laya   Legacy alias: select the hosted API provider or the local slot
+  fallback on|off     Legacy alias: change the local error fallback
+
+Response contract modes:
+  api_with_local_fallback   Hosted API first, local model on its failure
+  api_only                  Hosted API only, failure reported
+  local_only                Local model only, failure reported
+  local_with_api_fallback   Local model first, hosted API on its failure
+  Mode aliases: auto, jev_api, typesafe, openrouter, clef, clef_api,
+  clef_with_local_fallback, laya, laya_local, laya_then_hosted,
+  laya_with_jev_fallback
+
+Both sides are System One decision models (also called typed decision models):
+Jev, Clef and Clef Flash, Laya, Kev, and Tev1. Jev is one vendor's member of
+that category, not the category. See
+https://systemonemodels.org/guides/what-is-a-system-one-model/
 
 Current state: {state}
 """
+
+_MODE_USAGE = "Usage: /doga mode " + response_contract.accepted_mode_names()
 
 
 def _handle_doga(raw_args: str) -> Optional[str]:
@@ -547,6 +688,7 @@ def _handle_doga(raw_args: str) -> Optional[str]:
             f"  Enabled: {_state.enabled}\n"
             f"  Mode: {mode}\n"
             f"  Response contracts: {'enabled' if _state.jev_enabled else 'disabled'} (mode: {_state.decision_mode}, last: {_state._last_jev_status})\n"
+            f"  Local model: {_state.local_model_name()}\n"
             f"  Show simulation: {_state.show_simulation}\n"
             f"  Max scenarios: {_state.max_scenarios}\n"
             f"  De Bono hats: {hat_status}\n"
@@ -616,32 +758,32 @@ def _handle_doga(raw_args: str) -> Optional[str]:
             return "Invalid number. Use /doga max_recursion <1-5>."
 
     if sub == "mode":
-        modes = {
-            "jev_api": ("jev", False),
-            "clef_api": ("clef", False),
-            "laya_local": ("laya", False),
-            "laya_with_jev_fallback": ("laya", True),
-        }
-        if len(argv) != 2 or argv[1].lower() not in modes:
-            return "Usage: /doga mode jev_api|clef_api|laya_local|laya_with_jev_fallback"
-        _state.decision_provider, _state.jev_fallback = modes[argv[1].lower()]
+        if len(argv) != 2:
+            return _MODE_USAGE
+        # Non-strict: an unusable name here leaves the current mode alone.
+        if not _state._apply_mode(argv[1], strict=False):
+            return _MODE_USAGE
         _state._last_jev_status = "enabled"
         return f"DOGA response contract mode: {_state.decision_mode}."
 
     if sub == "provider":
-        if len(argv) != 2 or argv[1].lower() not in {"jev", "clef", "laya"}:
-            return "Usage: /doga provider jev|clef|laya"
-        _state.decision_provider = argv[1].lower()
-        _state.jev_fallback = False
+        if len(argv) != 2 or argv[1].lower() not in response_contract.PROVIDERS:
+            return "Usage: /doga provider " + "|".join(response_contract.PROVIDERS)
+        # Selecting a legacy provider resets the fallback, as it always did.
+        if not _state._apply_mode(argv[1].lower(), fallback=False, strict=False):
+            return "Usage: /doga provider " + "|".join(response_contract.PROVIDERS)
         _state._last_jev_status = "enabled"
         return f"DOGA response contract mode: {_state.decision_mode}."
 
     if sub == "fallback":
         if len(argv) != 2 or argv[1].lower() not in {"on", "off"}:
             return "Usage: /doga fallback on|off"
-        if _state.decision_provider != "laya":
-            return "Jev fallback is only available with Laya. Select /doga mode laya_with_jev_fallback."
-        _state.jev_fallback = argv[1].lower() == "on"
+        if _state.decision_provider != response_contract.LOCAL_PROVIDER:
+            return ("API fallback is only available with the local model. "
+                    "Select /doga mode local_with_api_fallback.")
+        if not _state._apply_mode(response_contract.LOCAL_PROVIDER,
+                                 fallback=argv[1].lower() == "on", strict=False):
+            return "Usage: /doga fallback on|off"
         return f"DOGA response contract mode: {_state.decision_mode}."
 
     if sub == "jev":
@@ -707,5 +849,5 @@ def register(ctx) -> None:
         "doga",
         handler=_handle_doga,
         description="Control DOGA probabilistic thinking.",
-        args_hint="on|off|status|mode jev_api|laya_local|laya_with_jev_fallback|auto|manual low|medium|high|depth <1-5>|hats on|off|max_recursion <1-5>|show|hide|memory on|off|jev on|off",
+        args_hint="on|off|status|mode " + "|".join(response_contract.MODES) + "|auto|manual low|medium|high|depth <1-5>|hats on|off|max_recursion <1-5>|show|hide|memory on|off|jev on|off",
     )

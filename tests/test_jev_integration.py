@@ -13,7 +13,10 @@ def test_jev_contract_is_used_in_pre_llm_prompt_when_enabled():
     }}
     with patch.object(plugin.response_contract, "evaluate_contract", return_value=fake) as call:
         result = plugin._on_pre_llm_call(user_message="What should I do?")
-    call.assert_called_once_with("What should I do?", provider="jev", fallback_to_jev=False)
+    # The canonical mode travels alongside the legacy pair and cannot be
+    # derived from it, since both API-led modes share one provider.
+    call.assert_called_once_with("What should I do?", provider="jev", fallback_to_jev=False,
+                                 mode="api_only", hosted="jev")
     assert "User goal: action" in result["context"]
     assert "recommendation; next_step" in result["context"]
     plugin._state.jev_enabled = False

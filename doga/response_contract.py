@@ -1,33 +1,67 @@
-"""Jev, Cloudflare Clef, or local Laya classification and DOGA contracts.
+"""Jev, Cloudflare Clef, or a local System One decision model, and DOGA contracts.
 
-Three decision engines share one contract. Each route is a replacement for the
-others rather than a member of a chain they all sit in:
+Both sides are members of the System One decision model category, also written
+typed decision model, coined by TypeSafe on 15 September 2026:
+https://systemonemodels.org/guides/what-is-a-system-one-model/ Jev is one
+vendor's member of that category, not the category itself. Membership and the
+shared wire contract are claims from those projects, not measurements made here.
 
-- ``jev`` is hosted, through OpenRouter first and direct TypeSafe second.
-- ``clef`` is hosted at Cloudflare Workers AI and needs an account ID plus an
-  API token with the Workers AI read permission. The account ID is
-  configuration, the token is a credential; neither is read from DOGA config.
-- ``laya`` runs in the Hermes process with no credential and no network egress.
+Two sides answer DOGA's five typed questions, and four canonical modes say
+which side leads and whether the other one is behind it as a fallback:
 
-Clef and Jev are both remote, so selecting either one sends the request off the
-machine. Selecting Laya does not. Only the explicit Laya-with-Jev-fallback route
-adds a second call, and only when the local attempt raises.
+=================  ==================  ==========
+Mode               Leads               Fallback
+=================  ==================  ==========
+api_only           the hosted API      none
+api_with_local_... the hosted API      the local model
+local_only         the local model     none
+local_with_...     the local model     the hosted API
+=================  ==================  ==========
+
+The hosted side is one of:
+
+- ``jev``, hosted through OpenRouter first and direct TypeSafe second.
+- ``clef``, hosted at Cloudflare Workers AI. It needs an account ID plus an API
+  token with the Workers AI read permission. The account ID is configuration,
+  the token is a credential; neither is read from DOGA config.
+
+The local side is a generic decision-model slot whose configuration name stays
+``laya``. ``DOGA_LOCAL_MODEL`` selects which local model answers, so swapping
+engines is configuration rather than a code change, and the default path is
+unchanged. The slot runs in the Hermes process with no credential and no network
+egress of its own.
+
+Both hosted providers are remote, so any mode that leads with one sends the
+request off the machine. A mode that leads with the local model does not, and
+sends the request off the machine only when the local attempt raises and the
+fallback breaker still allows it.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import threading
 import urllib.error
 import urllib.request
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 API_URL = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
 OPENROUTER_API_URL = "https://openrouter.ai/api/alpha/decisions"
 OPENROUTER_MODEL = "typesafe/jev-1.13"
 LAYA_MODEL = "convaiinnovations/laya"
+LOCAL_MODEL_ENV = "DOGA_LOCAL_MODEL"
+# A local engine name is either a bare engine id or a Hugging Face style
+# ``namespace/name``. Both are accepted verbatim and never mapped, because the
+# point of the slot is that an unlisted engine works without a code change.
+# Anything outside this shape is rejected: a name carrying whitespace, quotes,
+# a backslash, a control character, or a stray separator would corrupt the JSON
+# body it is embedded in or a URL path segment it is interpolated into.
+# Dots are allowed, because real engine ids carry them, such as
+# ``jeff-qwen3.5-0.8b``.
+_LOCAL_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
 # Clef is Cloudflare-hosted. The endpoint is per account, so the account ID is a
 # required part of the URL rather than an optional setting.
 CLEF_RUN_PATH = "/ai/run/@cf/cloudflare/{model}"
@@ -45,6 +79,7 @@ _laya_failure_lock = threading.Lock()
 _laya_failure_count = 0
 _LAYA_FALLBACK_FAILURE_LIMIT = 3
 _laya_agent: Any = None
+_laya_model: str | None = None
 QUESTIONS = {
     "goal": {"type": "choice", "instructions": "What is the user's primary desired outcome?", "criteria": {"information": "Factual answer, analysis, or explanation.", "understanding": "Feel heard, validated, or understood.", "action": "A decision, recommendation, or next step."}},
     "mode": {"type": "choice", "instructions": "What response mode best serves the request?", "criteria": {"answer": "Give the requested direct answer or information.", "explain": "Explain concepts or implications without deciding for the user.", "recommend": "Make a recommendation or propose a concrete next action.", "clarify": "A missing fact materially changes the answer; ask one focused question."}},
@@ -52,6 +87,155 @@ QUESTIONS = {
     "clarification": {"type": "noul", "instructions": "Would an unresolved ambiguity materially change the useful answer?", "criteria": {"true": "A key unknown changes the answer or recommendation.", "false": "A useful answer is possible without clarification."}},
     "scenario_need": {"type": "choice", "instructions": "What level of scenario analysis is useful for this request?", "criteria": {"none": "A direct response is sufficient; scenario analysis adds noise.", "compare_options": "The request involves meaningfully different plausible options or outcomes.", "uncertainty_analysis": "Explicit uncertain factors and outcomes merit sensitivity analysis."}},
 }
+
+# ---------------------------------------------------------------------------
+# Modes
+#
+# Four canonical names. Each resolves to a provider order expressed in concrete
+# provider names, and every alias is rewritten to a canonical name before it
+# reaches a chain, a log line, a diagnostic, or a URL, so no alias string is ever
+# observable.
+# ---------------------------------------------------------------------------
+
+class Mode(NamedTuple):
+    """One resolved mode: an ordered provider list plus what it names.
+
+    ``providers`` uses the concrete ``PROVIDERS`` names, so the same value can
+    drive both a chain and a dispatch lookup without a translation step.
+    ``hosted`` and ``fallback`` say which side leads and what sits behind it.
+    """
+
+    name: str
+    providers: tuple[str, ...]
+    hosted: str
+    fallback: str
+
+
+API_ONLY = "api_only"
+API_WITH_LOCAL_FALLBACK = "api_with_local_fallback"
+LOCAL_ONLY = "local_only"
+LOCAL_WITH_API_FALLBACK = "local_with_api_fallback"
+
+MODES = (API_WITH_LOCAL_FALLBACK, API_ONLY, LOCAL_ONLY, LOCAL_WITH_API_FALLBACK)
+MODE_DESCRIPTIONS = {
+    API_WITH_LOCAL_FALLBACK: "hosted API first, local model as fallback",
+    API_ONLY: "hosted API only, a failure is reported",
+    LOCAL_ONLY: "local model only, a failure is reported",
+    LOCAL_WITH_API_FALLBACK: "local model first, hosted API as fallback",
+}
+# The local slot's configuration name, and the concrete provider name for it.
+LOCAL_PROVIDER = "laya"
+HOSTED_PROVIDERS = ("jev", "clef")
+# Which hosted provider the API side resolves to when no mode or legacy
+# setting pins one. Jev is the shipped default and stays the default.
+DEFAULT_HOSTED = "jev"
+
+# The four canonical modes, parameterised by which hosted provider the API side
+# resolves to. Both canonical API modes name the same chain here: this
+# repository's API side is one hosted route, and a hosted failure has never been
+# rerouted to another provider, so ``api_with_local_fallback`` tries the hosted
+# side and then the local slot, and never a second hosted provider.
+_MODE_TABLE: dict[str, Mode] = {
+    API_ONLY: Mode(API_ONLY, ("hosted",), "hosted", "none"),
+    API_WITH_LOCAL_FALLBACK: Mode(API_WITH_LOCAL_FALLBACK, ("hosted", "laya"), "hosted", "laya"),
+    LOCAL_ONLY: Mode(LOCAL_ONLY, ("laya",), "laya", "none"),
+    LOCAL_WITH_API_FALLBACK: Mode(LOCAL_WITH_API_FALLBACK, ("laya", "hosted"), "laya", "hosted"),
+}
+
+# Which hosted provider each ``api_only`` alias pins. An alias naming a hosted
+# provider stays on that provider, exactly as it did before this change. The
+# bare ``DOGA_DECISION_PROVIDER`` spellings are here too, so that setting keeps
+# working unchanged on its own.
+_HOSTED_BY_API_ONLY_ALIAS = {
+    "jev": "jev",
+    "jev_api": "jev",
+    "typesafe": "jev",
+    "openrouter": "jev",
+    "clef": "clef",
+    "clef_api": "clef",
+}
+
+# Every accepted spelling. ``auto`` is resolved at load time rather than being a
+# fixed alias, because it means "API first when a local model is usable".
+MODE_ALIASES: dict[str, str] = {
+    **_HOSTED_BY_API_ONLY_ALIAS,
+    "auto": API_WITH_LOCAL_FALLBACK,
+    "clef_with_local_fallback": API_WITH_LOCAL_FALLBACK,
+    "laya": LOCAL_ONLY,
+    "laya_local": LOCAL_ONLY,
+    "laya_then_hosted": LOCAL_WITH_API_FALLBACK,
+    "laya_with_jev_fallback": LOCAL_WITH_API_FALLBACK,
+}
+
+# Shown wherever a caller needs the accepted names, for example the error for
+# an unknown mode and the ``/doga mode`` usage line.
+_ACCEPTED_MODES = (
+    f"{API_WITH_LOCAL_FALLBACK}, {API_ONLY}, {LOCAL_ONLY}, {LOCAL_WITH_API_FALLBACK} "
+    f"(aliases: {', '.join(sorted(MODE_ALIASES))})"
+)
+
+
+class ModeError(ValueError):
+    """An unknown mode name. The message lists every accepted spelling."""
+
+
+def _local_model_usable() -> bool:
+    """Whether the local slot can actually load, judged without importing it.
+
+    ``auto`` needs this: it must pick the local side only when a local model is
+    present. A missing import or an unset engine name is answered without
+    importing the engine, because ``auto`` is resolved once at plugin start.
+    """
+    if not local_model().strip():
+        return False
+    try:
+        import laya  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def resolve_mode(mode: str, *, hosted: str = "jev") -> Mode:
+    """Resolve any accepted mode spelling to a canonical :class:`Mode`.
+
+    Case-insensitive, and total: an unknown name raises :class:`ModeError` whose
+    message names every accepted spelling. ``hosted`` is the hosted provider the
+    API side resolves to, and is what keeps ``clef_api`` on Clef while
+    ``jev_api`` stays on Jev.
+    """
+    name = str(mode or "").strip().lower()
+    if not name:
+        raise ModeError(f"DOGA decision mode must be one of: {_ACCEPTED_MODES}")
+    if name in _MODE_TABLE:
+        # Already canonical. Returned through the table anyway, so the
+        # canonical name and its alias cannot drift apart.
+        canonical = name
+    elif name == "auto":
+        canonical = API_WITH_LOCAL_FALLBACK if _local_model_usable() else API_ONLY
+    elif name in _HOSTED_BY_API_ONLY_ALIAS:
+        hosted = _HOSTED_BY_API_ONLY_ALIAS[name]
+        canonical = API_ONLY
+    else:
+        resolved_alias = MODE_ALIASES.get(name)
+        if resolved_alias is None:
+            # The legacy DOGA_DECISION_PROVIDER value reaches this too, so the
+            # message names both settings rather than only the newer one.
+            raise ModeError(f"DOGA decision mode, or decision provider, must be one of: {_ACCEPTED_MODES}")
+        canonical = resolved_alias
+    resolved = _MODE_TABLE[canonical]
+    if "hosted" not in resolved.providers:
+        return resolved
+    if hosted not in HOSTED_PROVIDERS:
+        raise ModeError(f"DOGA hosted provider must be one of: {', '.join(HOSTED_PROVIDERS)}")
+    return resolved._replace(
+        providers=tuple(hosted if p == "hosted" else p for p in resolved.providers),
+        fallback=hosted if resolved.fallback == "hosted" else resolved.fallback,
+    )
+
+
+def accepted_mode_names() -> str:
+    """The accepted spellings, for help text and error messages."""
+    return _ACCEPTED_MODES
 
 
 def _request_typesafe(state: dict[str, Any], questions: dict[str, Any], api_key: str | None = None) -> dict[str, Any]:
@@ -122,16 +306,75 @@ def _request_jev(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, 
     raise RuntimeError("Set OPENROUTER_API_KEY or TYPESAFE_API_KEY to enable Jev")
 
 
-def _request_laya(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
-    """Use one cached local model; never fall back to a network provider."""
-    global _laya_agent
+def local_model() -> str:
+    """The local engine name sent to the local server, defaulting to Laya.
+
+    ``DOGA_LOCAL_MODEL`` is the generic slot selector. The value is passed
+    through verbatim: it is not checked against a list of known models, because
+    a new local engine must work without a code change. What is rejected is a
+    value that could not be used safely, namely an empty or whitespace-only
+    name, or one carrying a character that would corrupt the JSON body it is
+    embedded in or a URL path segment it is interpolated into. That is a
+    character check rather than a name check, so it rejects garbage without
+    rejecting an engine nobody has heard of.
+
+    An unset variable takes the default. A variable that is set but empty is an
+    error rather than a silent default, so a misconfigured value surfaces
+    instead of quietly answering as the default engine.
+
+    ``LAYA_MODEL`` is the default and keeps the shipped behaviour exactly: a
+    Hugging Face style id for the in-process Laya runtime.
+    """
+    configured = os.environ.get(LOCAL_MODEL_ENV)
+    if configured is None:
+        return LAYA_MODEL
+    name = configured.strip()
+    if not name:
+        raise RuntimeError(f"{LOCAL_MODEL_ENV} is set but empty; unset it to use the default")
+    if not _LOCAL_MODEL_PATTERN.match(name):
+        raise RuntimeError(
+            f"{LOCAL_MODEL_ENV} must be a bare engine id or a namespace/name path "
+            f"using letters, digits, dot, underscore, and hyphen"
+        )
+    if any(segment in {".", ".."} for segment in name.split("/")):
+        # Dots are legal inside a segment, so a whole '.' or '..' segment is
+        # what is rejected: the name would otherwise climb out of the path it
+        # is interpolated into.
+        raise RuntimeError(f"{LOCAL_MODEL_ENV} must not contain a '.' or '..' path segment")
+    return name
+
+
+def _load_local_agent(name: str):
+    """Load one local engine by name.
+
+    One agent is cached by the caller, keyed by name, so switching engines loads
+    the new one instead of reusing the previous engine's agent. There is no
+    second cache here on purpose: two caches would keep an agent alive after the
+    configured name changed, and would hold engine objects for engines no longer
+    selected.
+    """
     try:
         import laya
     except ImportError as exc:
-        raise RuntimeError("Local Laya is unavailable; install doga-hermes[laya] in Hermes' Python environment") from exc
+        # Named after the slot, not the default engine, because a non-default
+        # engine fails the same way: the runtime that loads one loads them all.
+        raise RuntimeError("The local decision model is unavailable; install doga-hermes[laya] in Hermes' Python environment") from exc
+    return laya.load(name)
+
+
+def _request_laya(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
+    """Use one cached local model; never fall back to a network provider.
+
+    The engine name comes from :func:`local_model`, so the slot is generic. The
+    cached agent is keyed by that name: switching engines loads the new one
+    rather than reusing the previous engine's agent.
+    """
+    global _laya_agent, _laya_model
+    model = local_model()
     with _laya_lock:
-        if _laya_agent is None:
-            _laya_agent = laya.load(LAYA_MODEL)
+        if _laya_agent is None or _laya_model != model:
+            _laya_agent = _load_local_agent(model)
+            _laya_model = model
         result = _laya_agent.predict(state, questions)
     if not isinstance(result, dict) or not isinstance(result.get("answers"), dict):
         raise RuntimeError("invalid local Laya response")
@@ -139,13 +382,13 @@ def _request_laya(state: dict[str, Any], questions: dict[str, Any]) -> dict[str,
     for name, question in questions.items():
         answer = answers.get(name)
         if not isinstance(answer, dict):
-            raise RuntimeError("invalid local Laya response: missing typed answer")
+            raise RuntimeError(f"invalid local Laya response: missing typed answer for {name!r}")
         if question["type"] == "choice" and answer.get("choice") not in question["criteria"]:
-            raise RuntimeError("invalid local Laya response: unknown choice")
+            raise RuntimeError(f"invalid local Laya response: unknown choice for {name!r}")
         if question["type"] == "noul":
             score = answer.get("noul")
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
-                raise RuntimeError("invalid local Laya response: invalid probability")
+                raise RuntimeError(f"invalid local Laya response: invalid probability for {name!r}")
     return result
 
 
@@ -153,9 +396,9 @@ def _clef_checkpoint() -> str:
     """The Clef checkpoint to call: the 27B ``clef`` by default, or ``clef-flash``.
 
     Clef Flash is the 9B variant Cloudflare documents for latency-bound paths.
-    Both answer the same System One shaped typed questions, so it is a setting
-    rather than a separate provider. An unknown value fails instead of silently
-    calling a checkpoint that does not exist.
+    Both are System One decision models answering the same typed questions, so
+    it is a setting rather than a separate provider. An unknown value fails
+    instead of silently calling a checkpoint that does not exist.
     """
     model = (os.environ.get(CLEF_MODEL_ENV) or CLEF_DEFAULT_MODEL).strip().lower()
     if model not in CLEF_MODELS:
@@ -227,45 +470,96 @@ def _clef_result(data: Any) -> dict[str, Any]:
     return {**data, "answers": answers, "_doga_provider": "clef"}
 
 
+def _request_by_provider(provider: str) -> Callable[..., dict[str, Any]]:
+    """Look the provider's request function up at call time.
+
+    Read from the module namespace on every call rather than captured in a table
+    built at import time, so replacing a route, whether in a test or at
+    runtime, is honoured everywhere. A captured table would silently keep
+    calling the original.
+    """
+    if provider == LOCAL_PROVIDER:
+        return _request_laya
+    return {"jev": _request_jev, "clef": _request_clef}[provider]
+
+
 def evaluate_contract(
     user_message: str,
     evaluator: Callable[..., dict[str, Any]] | None = None,
     provider: str = "jev",
     fallback_to_jev: bool = False,
+    mode: str | Mode | None = None,
+    hosted: str | None = None,
 ) -> dict[str, Any]:
-    """Ask independent typed judgments in one call over the request only."""
-    if provider not in PROVIDERS:
-        raise ValueError(f"DOGA decision provider must be one of: {', '.join(PROVIDERS)}")
+    """Ask independent typed judgments in one call over the request only.
+
+    ``mode`` is the canonical mode or any accepted alias and is resolved here, so
+    a caller holding only the old ``provider`` plus ``fallback_to_jev`` pair
+    keeps working and produces the same routing decision as before. ``provider``
+    selects the hosted side when the mode does not pin one, and ``hosted``
+    overrides that selection explicitly, which is what makes an API-led mode
+    reach a chosen hosted provider without naming a mode alias for it.
+    """
+    global _laya_failure_count
+    if mode is None:
+        # The legacy pair, so an existing configuration routes exactly as it did.
+        mode = LOCAL_WITH_API_FALLBACK if (provider == LOCAL_PROVIDER and fallback_to_jev) else provider
+    # A local-led mode resolves its own hosted side, so the seed only matters
+    # for the API side. Passing ``provider='laya'`` must not be mistaken for a
+    # request to pin the API side to the local slot.
+    seed = hosted or (provider if provider in HOSTED_PROVIDERS else DEFAULT_HOSTED)
+    if seed not in HOSTED_PROVIDERS:
+        raise ModeError(f"DOGA hosted provider must be one of: {', '.join(HOSTED_PROVIDERS)}")
+    resolved = mode if isinstance(mode, Mode) else resolve_mode(mode, hosted=seed)
+    if evaluator is None:
+        if len(resolved.providers) > 1:
+            return _evaluate_chain(resolved, user_message)
+        evaluator = _request_by_provider(resolved.providers[0])
     state = {"user_request": user_message}
-    if provider == "clef" and evaluator is None:
-        # Clef is a hosted route of its own. A Clef failure is a failure of this
-        # route, not a licence to call a second classifier, so there is no
-        # fallback branch here at all.
-        return _request_clef(state=state, questions=QUESTIONS)
-    if provider == "laya" and fallback_to_jev and evaluator is None:
-        global _laya_failure_count
+    result = evaluator(state=state, questions=QUESTIONS)
+    if resolved.providers[0] == LOCAL_PROVIDER:
+        with _laya_failure_lock:
+            _laya_failure_count = 0
+    return result
+
+
+def _evaluate_chain(resolved: Mode, user_message: str) -> dict[str, Any]:
+    """Run a two-provider chain, leading side first, on a configured trigger.
+
+    The only trigger is the leading call raising. A single-provider mode has no
+    chain at all, so a failure in ``api_only`` or ``local_only`` is reported and
+    never rerouted. The local-to-API chain keeps the existing cooldown: after
+    three consecutive local failures the API side is no longer called in this
+    process until a local evaluation succeeds.
+    """
+    global _laya_failure_count
+    lead, backup = resolved.providers
+    state = {"user_request": user_message}
+    if lead == "laya":
         try:
-            local = _request_laya(state=state, questions=QUESTIONS)
+            local = _request_by_provider("laya")(state=state, questions=QUESTIONS)
         except Exception as exc:
-            logger.warning("DOGA local Laya failed (%s); considering Jev fallback", type(exc).__name__)
+            logger.warning("DOGA local model failed (%s); considering hosted fallback", type(exc).__name__)
             with _laya_failure_lock:
                 _laya_failure_count += 1
                 allow_fallback = _laya_failure_count <= _LAYA_FALLBACK_FAILURE_LIMIT
             if not allow_fallback:
-                logger.warning("DOGA Jev fallback suppressed after repeated local failures")
+                logger.warning("DOGA hosted fallback suppressed after repeated local failures")
                 raise
-            remote = _request_jev(state=state, questions=QUESTIONS)
-            return {**remote, "_doga_provider": "jev_fallback"}
+            remote = _request_by_provider(backup)(state=state, questions=QUESTIONS)
+            return {**remote, "_doga_provider": f"{backup}_fallback"}
         with _laya_failure_lock:
             _laya_failure_count = 0
         return local
-    if evaluator is None:
-        evaluator = _request_laya if provider == "laya" else _request_jev
-    result = evaluator(state=state, questions=QUESTIONS)
-    if provider == "laya" and evaluator is _request_laya:
-        with _laya_failure_lock:
-            _laya_failure_count = 0
-    return result
+    # The API leads. It has never been rerouted to another hosted provider, so
+    # the only remaining provider is the local slot.
+    try:
+        hosted = _request_by_provider(lead)(state=state, questions=QUESTIONS)
+    except Exception as exc:
+        logger.warning("DOGA hosted API failed (%s); trying the local model", type(exc).__name__)
+        local = _request_by_provider("laya")(state=state, questions=QUESTIONS)
+        return {**local, "_doga_provider": "laya_fallback"}
+    return hosted
 
 
 def build_contract(response: dict[str, Any]) -> dict[str, Any]:

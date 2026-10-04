@@ -12,6 +12,9 @@ import doga.__init__ as plugin
 @pytest.fixture(autouse=True)
 def reset_laya_model(monkeypatch):
     monkeypatch.setattr(response_contract, "_laya_agent", None)
+    # The engine name is read from the environment on every call, so an ambient
+    # DOGA_LOCAL_MODEL would otherwise change which engine these tests load.
+    monkeypatch.delenv(response_contract.LOCAL_MODEL_ENV, raising=False)
 
 
 def _answers():
@@ -65,7 +68,8 @@ def test_laya_requires_full_typed_response(monkeypatch):
 
 def test_doga_can_select_local_provider_without_disabling_contract(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "jev")
-    assert "laya" in plugin._handle_doga("provider laya").lower()
+    # provider laya is a kept-working alias; it is reported canonically.
+    assert "local_only" in plugin._handle_doga("provider laya").lower()
     assert plugin._state.decision_provider == "laya"
     fake = _answers()
     monkeypatch.setattr(plugin._state, "enabled", True)
@@ -73,11 +77,15 @@ def test_doga_can_select_local_provider_without_disabling_contract(monkeypatch):
     monkeypatch.setattr(plugin._state, "memory_enabled", False)
     with patch.object(plugin.response_contract, "evaluate_contract", return_value=fake) as evaluator:
         result = plugin._on_pre_llm_call(user_message="Recommend one path")
-    evaluator.assert_called_once_with("Recommend one path", provider="laya", fallback_to_jev=False)
+    # The canonical mode travels with the legacy pair. It cannot be derived from
+    # them, because api_with_local_fallback and api_only share a provider and
+    # differ only in what sits behind it.
+    evaluator.assert_called_once_with("Recommend one path", provider="laya", fallback_to_jev=False,
+                                      mode="local_only", hosted="jev")
     assert "[DOGA response contract]" in result["context"]
     assert "make the answer conditional" in result["context"]
-    assert "laya" in plugin._handle_doga("status").lower()
-    assert "jev" in plugin._handle_doga("provider jev").lower()
+    assert "local_only" in plugin._handle_doga("status").lower()
+    assert "api_only" in plugin._handle_doga("provider jev").lower()
     assert plugin._state.decision_provider == "jev"
 
 
@@ -129,7 +137,7 @@ def test_explicit_local_failure_uses_jev_fallback(monkeypatch):
         result = plugin._on_pre_llm_call(user_message="public test request")
     assert remote.call_count == 1
     assert "[DOGA response contract]" in result["context"]
-    assert plugin._state._last_jev_status == "ok (jev fallback)"
+    assert plugin._state._last_jev_status == "ok (fallback)"
 
 
 def test_healthy_laya_does_not_use_remote_even_with_fallback_enabled():

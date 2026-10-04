@@ -8,7 +8,7 @@
 
 **Probabilistic, goal-aware thinking layer for Hermes Agent.**
 
-Built by [@0z1-ghb](https://github.com/0z1-ghb). This independent fork adds typed response contracts using Jev (OpenRouter primary, direct TypeSafe fallback), Cloudflare Clef on Workers AI, or optional local Laya.
+Built by [@0z1-ghb](https://github.com/0z1-ghb). This independent fork adds typed response contracts using a hosted API (Jev through OpenRouter with direct TypeSafe fallback, or Cloudflare Clef on Workers AI) or an interchangeable local decision model. Both sides are [System One decision models](https://systemonemodels.org/guides/what-is-a-system-one-model/), also written *typed decision model*: a model that returns typed values (Choice, Score, Noul) with a probability for each, rather than prose. TypeSafe coined the category alongside Jev on 15 September 2026. Jev is one vendor's member of it, not the category.
 
 DOGA (Doğa, Turkish for “nature”) adds scenario simulation, Monte Carlo reasoning, and goal detection to Hermes responses. It remains a plugin and does not modify Hermes core.
 
@@ -17,7 +17,7 @@ DOGA (Doğa, Turkish for “nature”) adds scenario simulation, Monte Carlo rea
 ## Features
 
 - **Goal Detection**  Identifies whether the user needs Information, Understanding, or Action before responding
-- **Four Response Contract Modes**  Choose Jev via API, Clef via Cloudflare Workers AI, Laya locally, or Laya locally with Jev as an error fallback. Each classifier replaces the others rather than joining them in a chain. Any classifier judges the user's goal, response mode, stakes, need for clarification, and scenario analysis. DOGA turns that assessment into answer requirements for the main model. Jev uses OpenRouter first with direct TypeSafe fallback; Clef calls Cloudflare once; healthy Laya makes no classifier provider API call.
+- **Four Response Contract Modes**  Choose the hosted API or the local model, each alone or with the other as its error fallback: `api_only`, `api_with_local_fallback`, `local_only`, or `local_with_api_fallback`. The hosted side is Jev (OpenRouter first, direct TypeSafe fallback) or Cloudflare Clef on Workers AI. The local side is a configurable slot whose engine is selected by `DOGA_LOCAL_MODEL` and defaults to Laya. Any of them judges the user's goal, response mode, stakes, need for clarification, and scenario analysis. DOGA turns that assessment into answer requirements for the main model. A healthy local engine makes no classifier provider API call.
 - **Scenario Generation**  Prompts the LLM to enumerate and weigh multiple interpretations
 - **Monte Carlo Simulation**  Pure Python engine (10,000 to 50,000 iterations) for quantitative probability analysis, using 0 LLM tokens
 - **Thinking Panel**  `<world_model>` reasoning blocks are extracted and displayed as a structured `[DOGA: Thinking Process]` panel before the final response
@@ -27,6 +27,30 @@ DOGA (Doğa, Turkish for “nature”) adds scenario simulation, Monte Carlo rea
 - **De Bono Thinking Hats**  Structured parallel reasoning through Six Thinking Hats lenses, depth aware (White, Black, Yellow, Green, Red), optional, enabled by default
 - **Recursive Reasoning**  `reason_deeper` tool for multi-level self-critique; each recursion level uses a different De Bono hat lens; hierarchical panel output
 - **Hard-Break Safety**  Automatic stop after 3 ignored `reason_deeper` calls prevents tool-loop starvation
+
+---
+
+## System One decision models
+
+The category term is **System One decision model**, also written *typed decision model* ([reference](https://systemonemodels.org/guides/what-is-a-system-one-model/)). A member returns typed values (Choice, Score, Noul) with a probability for each instead of prose, which is why DOGA's five facets map onto any of them without a second contract. TypeSafe coined the term on 15 September 2026 alongside Jev; it is also written System 1. **Jev is one vendor's member of the category, not the category.** This documentation never calls the category "Jev-like".
+
+Other members catalogued in the same index: **CLM** and **GLiNER2.5-Decide** (open weights), plus hosted **d1** (Liquid AI), **Mercury Decide** (Inception, free on OpenRouter), **Solar Decide** (Upstage), **pplx-decider** (Perplexity), **Span-01** (Respan), **Decider 1** (meraGPT), and the **OpenAI Decisions API**.
+
+Members worth naming:
+
+| Model | Host | Weights | Note |
+| --- | --- | --- | --- |
+| **Jev** | TypeSafe, or through OpenRouter | closed | DOGA's default hosted side, model `typesafe/jev-1.13` |
+| **Clef**, **Clef Flash** | Cloudflare Workers AI | closed as served, Apache 2.0 weights published | `clef` 27B and `clef-flash` 9B; the second hosted side |
+| **Laya** | local, runs in the Hermes process | open | Convai Innovations. The local slot's default |
+| **Kev** | local or any host | open | 0.8B to 27B on Qwen3.5 and Qwen3.8 bases; serves the same `/v1/systemone` request shape as TypeSafe's API |
+| **Tev1** | Together AI | open | Qwen3.5-based; `Tev1-4B` and `Tev1-0.8B` checkpoints |
+
+Honest limit: membership of the category and the shared wire contract are documented claims from those projects, not measurements made here. Nothing below was confirmed by calling a provider, apart from the two live behaviours this repository has already recorded in its changelog: local Laya inference with a cached checkpoint, and one Jev request made under a key that has since been removed.
+
+### Repository topic tags
+
+This repository carries these GitHub topics, so the tags and this documentation name the same taxonomy: `cloudflare`, `clef`, `laya`, `kev`, `tev1`, `system-one`, `decision-model`, alongside its existing `doga`, `hermes-agent`, `jev`, `monte-carlo`, `openrouter`, `probabilistic-reasoning`, and `typesafe` topics.
 
 ---
 
@@ -48,39 +72,81 @@ No configuration changes are needed. DOGA detects Mnemosyne at runtime.
 
 ### Decision mode setup
 
-The default is `jev_api`. Select exactly one route with `/doga mode jev_api`, `/doga mode clef_api`, `/doga mode laya_local`, or `/doga mode laya_with_jev_fallback` for the current process. Set `DOGA_DECISION_MODE` to one of those names in the Hermes process environment for selection at startup. This setting takes precedence over the legacy `DOGA_DECISION_PROVIDER` and `DOGA_LAYA_JEV_FALLBACK` variables. The running gateway needs a restart to pick up environment or plugin-file changes; the slash command only changes i
+The default is `api_only`, which is Jev through OpenRouter with direct TypeSafe failover. Select a mode with `/doga mode <mode>` for the current process, or set `DOGA_DECISION_MODE` to the same names in the Hermes process environment to select one at startup. This setting takes precedence over the legacy `DOGA_DECISION_PROVIDER` and `DOGA_LAYA_JEV_FALLBACK` variables. The running gateway needs a restart to pick up environment or plugin-file changes; the slash command only changes the current process.
 
-| Mode | Classifier path | When the request leaves DOGA for a classifier |
+There are four modes. Each says which side answers and whether the other side sits behind it as a fallback:
+
+| Mode | Leads | Fallback | Classifier path | When the request leaves DOGA for a classifier |
+| --- | --- | --- | --- | --- |
+| `api_only` | Hosted API | none | Jev through OpenRouter, then direct TypeSafe on API failure; or Clef on Workers AI | Every classified request |
+| `api_with_local_fallback` | Hosted API | Local model | The hosted route, then the local model on a hosted failure | Every classified request; a hosted failure also reaches the local model |
+| `local_only` | Local model | none | The local model only | Never, once the engine is cached |
+| `local_with_api_fallback` | Local model | Hosted API | The local model first; the hosted route only on a local exception | Only if local load, inference, or schema validation fails, up to three consecutive failures |
+
+`api_only` and `local_only` are single-provider routes. A failure is reported and never rerouted, and neither keeps a cooldown list. `api_with_local_fallback` and `local_with_api_fallback` are two-provider chains and use the existing cooldown, trigger, and breaker machinery unchanged.
+
+Both hosted providers are remote, so any mode that leads with one sends the request off the machine. Only `local_only` and a healthy `local_with_api_fallback` keep classification entirely local. A hosted failure has never been rerouted to a *different* hosted provider: `api_with_local_fallback` tries the hosted route and then the local slot, never Jev on top of Clef, because a failure of one classifier is not permission to silently ask a different one.
+
+### Mode aliases
+
+Every mode name this plugin has ever accepted keeps working. An alias selects the mode it names and is then reported canonically, so an old name never appears in status output, a log line, or a request.
+
+| Accepted name | Resolves to | Notes |
 | --- | --- | --- |
-| `jev_api` | Jev through OpenRouter, then direct TypeSafe on API failure | Every classified request |
-| `clef_api` | Clef on Cloudflare Workers AI, one call | Every classified request |
-| `laya_local` | Local Laya only | Never |
-| `laya_with_jev_fallback` | Local Laya first; Jev only on a local exception | Only if Laya load, inference, or schema validation fails, up to three consecutive failures |
+| `api_with_local_fallback` | itself | Canonical |
+| `api_only` | itself | Canonical |
+| `local_only` | itself | Canonical |
+| `local_with_api_fallback` | itself | Canonical |
+| `auto` | `api_with_local_fallback`, else `api_only` | Picks the local side only when a usable local model is present |
+| `jev`, `jev_api`, `typesafe`, `openrouter` | `api_only` on Jev | `typesafe` and `openrouter` do not pin one over the other; Jev's own OpenRouter-then-TypeSafe order applies |
+| `clef`, `clef_api` | `api_only` on Clef | |
+| `clef_with_local_fallback` | `api_with_local_fallback` on Clef | |
+| `laya`, `laya_local` | `local_only` | |
+| `laya_then_hosted`, `laya_with_jev_fallback` | `local_with_api_fallback` | |
 
-Jev and Clef are both hosted, so both send the request off the machine. Only `laya_local` and a healthy `laya_with_jev_fallback` keep classification entirely local. Clef has **no** fallback route: a Clef failure leaves DOGA on its ordinary guidance rather than reaching for Jev or Laya, because a failure of one classifier is not permission to silently ask a different one. If you want a remote fallback for a local classifier, that is `laya_with_jev_fallback`, and it targets Jev only.
+Names are case-insensitive. An unrecognised name is rejected and, in the case of `DOGA_DECISION_MODE`, reported as an invalid mode so a typo fails closed instead of quietly routing somewhere nobody asked for. The error names every accepted spelling.
 
-The fallback is **error-only**, not a quality or low-confidence fallback. A successful but incorrect Laya judgment does not invoke Jev. Following three consecutive local failures, DOGA suppresses further remote fallback and retains ordinary guidance until a local evaluation succeeds. The warning log records only the error type, not the request. The main Hermes model and other plugins have their own separate network behavior. A [matched 100-question evaluation](docs/benchmarks/2026-09-26-100-question.md) found that local Laya underperformed Jev against authored labels, so keep `jev_api` as the recommended default until Laya questions and checkpoint are validated on new labels.
+The fallback is **error-only**, not a quality or low-confidence fallback. A successful but incorrect local judgment does not invoke the API. Following three consecutive local failures, DOGA suppresses further remote fallback and retains ordinary guidance until a local evaluation succeeds. The warning log records only the error type, not the request. The main Hermes model and other plugins have their own separate network behavior. A [matched 100-question evaluation](docs/benchmarks/2026-09-26-100-question.md) found that the local model underperformed Jev against authored labels, so keep `api_only` as the recommended default until local questions and the checkpoint are validated on new labels.
 
 For live Jev assessments, make `OPENROUTER_API_KEY` available to the Hermes process. To enable TypeSafe failover, also provide `TYPESAFE_API_KEY`. DOGA reads keys from the process environment, not DOGA configuration or model prompts. Without either key, the Jev request cannot be evaluated and DOGA continues with its standard guidance.
 
 DOGA sends the user's request to Jev through OpenRouter first, using model `typesafe/jev-1.13` at `https://openrouter.ai/api/alpha/decisions`. If that key is missing or the request fails, DOGA tries TypeSafe directly, using model `jev-latest` at `https://api.typesafe.ai/v1/systemone`. If only `TYPESAFE_API_KEY` is set, DOGA uses the direct TypeSafe route. If both calls fail, DOGA continues with its standard guidance. `JEV_PROVIDER_MODE` configures the separate `jev-decisions` Hermes plugin and does not control DOGA's provider route.
 
-For local Laya, install the optional extra **in the Python environment running Hermes**, then select it:
+### Local decision models
+
+The local side is a generic System One decision-model slot. Its configuration name stays `laya`, but that name no longer binds one engine: `DOGA_LOCAL_MODEL` selects which local System One model answers.
+
+| Setting | Kind | Default | Purpose |
+| --- | --- | --- | --- |
+| `DOGA_LOCAL_MODEL` | Configuration | `convaiinnovations/laya` | The checkpoint or engine name sent to the local server |
+
+Select the local side with `local_only` or `local_with_api_fallback`, then point it at an engine:
 
 ```bash
 # Run from this fork's checkout:
 uv pip install --python /path/to/hermes-python '.[laya]'
-# Select /doga mode laya_local for this process, or set
-# DOGA_DECISION_MODE=laya_local in Hermes' startup environment.
+# Select /doga mode local_only for this process, or set
+# DOGA_DECISION_MODE=local_only in Hermes' startup environment.
+# Then choose the engine, for example:
+# DOGA_LOCAL_MODEL=kev
 ```
 
-If you copied the plugin directory instead of installing the Python package, install `laya>=0.3.20,<1` into Hermes' Python environment. The optional dependency brings PyTorch and Transformers; allow disk space for them and the model checkpoint. The default model is `convaiinnovations/laya`, loaded once and reused. Its first load can download weights from Hugging Face and block the first classified request while doing so. Cache the checkpoint before using `HF_HUB_OFFLINE=1` for offline operation. A local smoke test emitted a Laya warning about invalid saved choice temperatures that it clamped; treat affected confidence values as uncalibrated. No Jev keys are needed for `laya_local`. Invalid mode names fail closed to ordinary guidance rather than remote Jev.
+If you copied the plugin directory instead of installing the Python package, install `laya>=0.3.20,<1` into Hermes' Python environment. The optional dependency brings PyTorch and Transformers; allow disk space for them and the model checkpoint. The default engine is `convaiinnovations/laya`, loaded once per process and reused; switching `DOGA_LOCAL_MODEL` loads the newly named engine rather than reusing the previous one. Its first load can download weights from Hugging Face and block the first classified request while doing so. Cache the checkpoint before using `HF_HUB_OFFLINE=1` for offline operation. A local smoke test emitted a Laya warning about invalid saved choice temperatures that it clamped; treat affected confidence values as uncalibrated. No Jev keys are needed for `local_only`.
 
-For an explicit remote error fallback select `/doga mode laya_with_jev_fallback` or set `DOGA_DECISION_MODE=laya_with_jev_fallback` at startup. Set `OPENROUTER_API_KEY` and optionally `TYPESAFE_API_KEY` in Hermes' secret environment. OpenRouter is tried first; direct TypeSafe is tried if the first route fails. The user request is sent to those providers on a local error, so use `laya_local` if local-only classification is required. Legacy `/doga provider jev|clef|laya` and `/doga fallback on|off` still work; selecting a legacy provider resets fallback to off, and `fallback on` is rejected in Jev and Clef modes.
+`DOGA_LOCAL_MODEL` is **not** checked against a list of known engines. That is deliberate: the whole point of the slot is that a new local System One decision model works by configuration alone, with no code change. Only a value that could not be used safely is rejected, namely an empty or whitespace-only value, a value containing whitespace, quotes, a backslash, a control character, or a URL separator, and a `.` or `..` path segment. System One decision models known to speak the same `/v1/systemone` contract and therefore fit this slot:
+
+| Engine | Note |
+| --- | --- |
+| `laya` | Convai Innovations. Also `laya-multilingual` and `laya-typed-decisions`. The default |
+| `kev` | Open weights, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases, also published as `kev-0.8b`. Serves the same `/v1/systemone` request shape as TypeSafe's API |
+| `tev1` | Together AI, Qwen3.5-based, open weights. `Tev1-4B` and `Tev1-0.8B` checkpoints |
+| `jeff-qwen3.5-0.8b`, `jeff-gemma4-e2b` | |
+
+Listing an engine here is a documented claim from its own project that it speaks the shared contract; it is not a measurement made in this repository. For the interchangeable-engine claim, see [chaitin/Decis](https://github.com/chaitin/Decis), which is self-hosted, serves the shared `/v1/systemone` contract that Jev's TypeSafe route also uses, and ships one Docker image per engine, so swapping `base_url` is the whole migration. For Tev1, see [togethercomputer/tev1](https://github.com/togethercomputer/tev1). A local server URL remains its own setting; pointing DOGA at a different engine's server is a configuration change, not a code change. An unrecognised mode name fails closed to ordinary guidance rather than reaching for the API.
 
 ### Cloudflare Clef setup
 
-[Clef](https://developers.cloudflare.com/workers-ai/models/clef/) is Cloudflare's decision model, in the same typed-answer family as Jev. It reads a state plus a set of typed `noul`, `choice`, and `score` questions and returns a probability for every allowed answer, so the same five DOGA facets map onto it without a second contract. Cloudflare hosts two checkpoints, both Apache 2.0 licensed:
+[Clef](https://developers.cloudflare.com/workers-ai/models/clef/) is Cloudflare's System One decision model, a member of the same category as Jev rather than something derived from it. It reads a state plus a set of typed `noul`, `choice`, and `score` questions and returns a probability for every allowed answer, so the same five DOGA facets map onto it without a second contract. Cloudflare hosts two checkpoints, both Apache 2.0 licensed:
 
 | Checkpoint | Size | Use |
 | --- | --- | --- |
@@ -103,7 +169,7 @@ CLOUDFLARE_API_TOKEN=<token with Account > Workers AI > Read>
 # Optional: DOGA_CLEF_MODEL=clef-flash  (defaults to clef)
 ```
 
-Select `/doga mode clef_api` for the current process, or set `DOGA_DECISION_MODE=clef_api` at startup. Both values are checked before any request, and a missing one fails with the variable name rather than a silent fallback. Every classified request is sent to Cloudflare, so treat `clef_api` as a remote route like `jev_api`. DOGA validates Clef's typed answers against the same criteria it uses for Jev, rejects an unknown choice or an out-of-range probability, and reads both the bare model output and Cloudflare's `success`/`result` REST envelope, surfacing Cloudflare's own error codes on failure. On any failure DOGA keeps its ordinary guidance. No key is written to disk, and warning logs record the error type only, never the request or the token.
+Select `/doga mode api_only` after selecting Clef, or `/doga mode clef_api` for the same result in one step, or set `DOGA_DECISION_MODE=clef_api` at startup. Both values are checked before any request, and a missing one fails with the variable name rather than a silent fallback. Every classified request is sent to Cloudflare, so treat `api_only` on Clef as a remote route like Jev's. DOGA validates Clef's typed answers against the same criteria it uses for Jev, rejects an unknown choice or an out-of-range probability, and reads both the bare model output and Cloudflare's `success`/`result` REST envelope, surfacing Cloudflare's own error codes on failure. On any failure DOGA keeps its ordinary guidance. No key is written to disk, and warning logs record the error type only, never the request or the token.
 
 Enable the DOGA plugin in `~/.hermes/config.yaml`:
 
@@ -139,22 +205,22 @@ doga:
 | `/doga hide` | Hide simulation panel |
 | `/doga memory on` | Enable goal memory (requires Mnemosyne) |
 | `/doga memory off` | Disable goal memory |
-| `/doga mode jev_api` | Use remote Jev classifier (recommended default) |
-| `/doga mode clef_api` | Use Cloudflare Clef on Workers AI as the classifier |
-| `/doga mode laya_local` | Use only local Laya for classification |
-| `/doga mode laya_with_jev_fallback` | Use Laya, with Jev only on local errors |
+| `/doga mode api_only` | Use the hosted API only (recommended default). Aliases: `jev_api`, `clef_api`, `typesafe`, `openrouter`, `clef` |
+| `/doga mode api_with_local_fallback` | Use the hosted API first, the local model on its failure. Alias: `clef_with_local_fallback`, `auto` |
+| `/doga mode local_only` | Use only the local model. Aliases: `laya`, `laya_local` |
+| `/doga mode local_with_api_fallback` | Use the local model first, the hosted API on its failure. Aliases: `laya_with_jev_fallback`, `laya_then_hosted` |
 | `/doga jev off` | Legacy alias: disable response contracts for the selected classifier |
 | `/doga jev on` | Legacy alias: re-enable response contracts |
 | `/doga provider clef` | Legacy alias: select Cloudflare Clef and reset fallback |
-| `/doga provider laya` | Legacy alias: select local-only Laya and reset fallback |
+| `/doga provider laya` | Legacy alias: select the local model only and reset fallback |
 | `/doga provider jev` | Legacy alias: select Jev and reset fallback |
-| `/doga fallback on` | Legacy alias: enable error fallback when Laya is selected |
-| `/doga fallback off` | Legacy alias: keep Laya errors local |
+| `/doga fallback on` | Legacy alias: enable the API fallback when the local model leads |
+| `/doga fallback off` | Legacy alias: keep local errors local |
 | `/doga max_recursion 3` | Example: set maximum `reason_deeper` depth from 1 to 5 |
 
-### Response Contract with Jev, Clef, or Laya
+### Response Contract with the hosted API or the local model
 
-Jev, Cloudflare Clef, and Laya are typed decision models used here as alternative request classifiers. Jev is the default; select Clef for Cloudflare-hosted inference, or Laya for local inference. For each user request, DOGA asks the selected model for one structured assessment of five facets:
+The hosted API and the local model are System One decision models used here as the two sides of one classifier route. The hosted side is Jev by default or Cloudflare Clef; the local side is whichever System One engine `DOGA_LOCAL_MODEL` selects. For each user request, DOGA asks the selected model for one structured assessment of five facets:
 
 1. **Goal:** information, understanding, or action.
 2. **Response mode:** answer, explain, recommend, or clarify.
@@ -162,13 +228,13 @@ Jev, Cloudflare Clef, and Laya are typed decision models used here as alternativ
 4. **Clarification:** whether a missing fact materially changes the useful answer.
 5. **Scenario need:** none, compare options, or analyze explicit uncertainty.
 
-DOGA maps those judgments into a compact response contract. An action request can require a recommendation and next step, and high stakes add material risks and uncertainty. When the selected model chooses clarify and its ambiguity score is at least 0.7, DOGA asks one focused question. When the ambiguity score is at least 0.7 but it selects another response mode, DOGA preserves that mode while requiring a conditional answer that states material assumptions and what missing information could change the answer. The contract is added to DOGA's pre-model guidance; the main Hermes model still reasons through the task and writes the answer. None of Jev, Clef, or Laya writes the final response. Laya's scores have not been calibrated on DOGA's five questions, and Clef's have not been measured against them either, so do not assume their classifications or the shared 0.7 threshold perform like Jev's; evaluate against labeled examples before relying on either for consequential decisions.
+DOGA maps those judgments into a compact response contract. An action request can require a recommendation and next step, and high stakes add material risks and uncertainty. When the selected model chooses clarify and its ambiguity score is at least 0.7, DOGA asks one focused question. When the ambiguity score is at least 0.7 but it selects another response mode, DOGA preserves that mode while requiring a conditional answer that states material assumptions and what missing information could change the answer. The contract is added to DOGA's pre-model guidance; the main Hermes model still reasons through the task and writes the answer. None of these models writes the final response. The local engine's scores have not been calibrated on DOGA's five questions, and Clef's have not been measured against them either, so do not assume their classifications or the shared 0.7 threshold perform like Jev's; evaluate against labeled examples before relying on either for consequential decisions.
 
 With Jev selected, the classification request goes to OpenRouter. TypeSafe is tried only when OpenRouter is unavailable or its request fails, or when no OpenRouter key is configured. The same user request may therefore be sent to TypeSafe during failover. Use this feature only when sending that request to those providers is acceptable; provider usage may incur charges. If both routes fail, DOGA keeps its ordinary goal and scenario guidance without a typed contract and logs the failure category without the request.
 
 With Clef selected, the request goes to Cloudflare Workers AI in one call, and only to Cloudflare. There is no second provider behind it, so the request is not also sent to Jev or Laya when Clef fails. Clef usage is billed by Cloudflare through Workers AI neurons, so the same cost consideration applies. If the request fails, DOGA keeps its ordinary guidance.
 
-That routing applies in `jev_api` or when Laya fails in `laya_with_jev_fallback`. In `laya_local`, classification stays local after the checkpoint is cached; a missing dependency, failed model load, or invalid result produces ordinary DOGA guidance. In fallback mode the first three consecutive local failures may each send a request remotely; subsequent failures stay local until a successful Laya evaluation resets the counter. This is a per-process limit, not a durable rate limit across restarts. The main Hermes model and other enabled tools or plugins may still make their own network requests. The old `/doga jev on|off` command remains for compatibility and toggles response contracts for any mode.
+That routing applies in `api_only` or when the local engine fails in `local_with_api_fallback`. In `local_only`, classification stays local after the engine is cached; a missing dependency, failed engine load, or invalid result produces ordinary DOGA guidance. In `local_with_api_fallback` the first three consecutive local failures may each send a request remotely; subsequent failures stay local until a successful local evaluation resets the counter. This is a per-process limit, not a durable rate limit across restarts. The main Hermes model and other enabled tools or plugins may still make their own network requests. The old `/doga jev on|off` command remains for compatibility and toggles response contracts for any mode.
 
 ### Simulate Tool
 
@@ -219,9 +285,9 @@ No Hermes core files are modified. DOGA is a pure plugin.
 
 ## About
 
-This repository is an independent fork and adjustment of [DOGA by @0z1-ghb](https://github.com/0z1-ghb/doga-hermes), released under the upstream MIT license. It retains DOGA's original probabilistic reasoning, simulation, and Hermes plugin behavior, and adds response contracts through Jev (OpenRouter primary, direct TypeSafe fallback) or optional local Laya. The selected model classifies the user's request; the main Hermes model remains responsible for reasoning through it and writing the answer.
+This repository is an independent fork and adjustment of [DOGA by @0z1-ghb](https://github.com/0z1-ghb/doga-hermes), released under the upstream MIT license. It retains DOGA's original probabilistic reasoning, simulation, and Hermes plugin behavior, and adds response contracts through a hosted API (Jev through OpenRouter with direct TypeSafe fallback, or Cloudflare Clef) or an interchangeable local decision model, all of them members of the System One decision model category. The selected model classifies the user's request; the main Hermes model remains responsible for reasoning through it and writing the answer.
 
-Original DOGA was built by [@0z1-ghb](https://github.com/0z1-ghb). This community maintained fork adds Jev and Laya response contracts and is not an official Hermes, TypeSafe, OpenRouter, or Laya project.
+Original DOGA was built by [@0z1-ghb](https://github.com/0z1-ghb). This community maintained fork adds Jev and Laya response contracts and is not an official Hermes, TypeSafe, OpenRouter, Cloudflare, Convai Innovations, or Laya project.
 
 ---
 

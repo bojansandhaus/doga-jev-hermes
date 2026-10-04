@@ -66,13 +66,16 @@ def test_clef_is_a_valid_provider_name():
 
 def test_clef_mode_is_selectable_and_reported(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "jev")
+    # clef_api is a kept-working alias. It selects the mode and is reported
+    # canonically as api_only, because an alias must not reach observable output.
     message = plugin._handle_doga("mode clef_api")
-    assert "clef_api" in message
+    assert "api_only" in message
+    assert "clef_api" not in message
     assert plugin._state.decision_provider == "clef"
     assert plugin._state.jev_fallback is False
-    assert plugin._state.decision_mode == "clef_api"
-    assert "clef_api" in plugin._handle_doga("status")
-    assert "clef_api" in plugin._handle_doga("help")
+    assert plugin._state.decision_mode == "api_only"
+    assert "api_only" in plugin._handle_doga("status")
+    assert "api_only" in plugin._handle_doga("help")
 
 
 def test_clef_sends_only_to_cloudflare(monkeypatch):
@@ -179,7 +182,7 @@ def test_clef_failure_never_reaches_jev_or_laya(monkeypatch):
     assert "[DOGA response contract]" not in result["context"]
     assert result["context"]
     assert plugin._state._last_jev_status == "error"
-    assert "clef_api" in plugin._handle_doga("status")
+    assert "api_only" in plugin._handle_doga("status")
 
 
 def test_clef_builds_the_same_contract_shape(monkeypatch):
@@ -240,14 +243,14 @@ def test_clef_credentials_never_appear_in_the_log(monkeypatch, caplog):
 def test_clef_legacy_provider_alias_still_works(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "jev")
     message = plugin._handle_doga("provider clef")
-    assert "clef_api" in message
+    assert "api_only" in message
     assert plugin._state.decision_provider == "clef"
 
 
 def test_invalid_mode_is_rejected_without_changing_state(monkeypatch):
     monkeypatch.setattr(plugin._state, "decision_provider", "clef")
     message = plugin._handle_doga("mode something-else")
-    assert "clef_api" in message
+    assert "api_only" in message
     assert plugin._state.decision_provider == "clef"
 
 
@@ -257,7 +260,8 @@ def test_startup_mode_selects_clef(monkeypatch):
     monkeypatch.delenv("DOGA_LAYA_JEV_FALLBACK", raising=False)
     state = plugin._PluginState()
     assert state.decision_provider == "clef"
-    assert state.decision_mode == "clef_api"
+    # The alias is accepted and reported as the canonical name it denotes.
+    assert state.decision_mode == "api_only"
 
 
 def test_clef_is_never_implicitly_fallback_for_laya(monkeypatch):
