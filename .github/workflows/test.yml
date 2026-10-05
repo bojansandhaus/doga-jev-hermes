@@ -1,6 +1,11 @@
 name: test
 
-on: [push, pull_request]
+# workflow_dispatch is here on purpose. This repository is a fork, and its
+# Actions history shows the trap: the workflow file existed and was registered
+# as active, yet no run was ever created. Adding workflow_dispatch means a
+# green baseline can be produced on demand rather than depending on the next
+# push happening to be the first one GitHub schedules.
+on: [push, pull_request, workflow_dispatch]
 
 jobs:
   test:
@@ -13,5 +18,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install pytest
+      - run: pip install pytest ruff
+      # Install the package before the tests. Without this the suite runs
+      # against whatever happens to be importable from the checkout, so a
+      # packaging regression passes CI silently. This is what pins the build
+      # backend fix: a broken build-backend fails here rather than in a release.
+      - run: pip install -e .
+      # Only the correctness rules are gated. The wider default set has 79
+      # pre-existing findings in this fork and is a separate cleanup, so
+      # enabling it here would be a red build on an unrelated change.
+      - name: Lint (ruff, correctness rules)
+        run: ruff check --select F .
       - run: pytest -v

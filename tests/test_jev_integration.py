@@ -1,4 +1,3 @@
-import json
 from unittest.mock import patch
 import doga.__init__ as plugin
 

@@ -85,10 +85,15 @@ def test_typesafe_http_request_uses_current_endpoint_and_secret_header():
         def __exit__(self, *args):
             return False
         def read(self):
-            return b'{"answers": {}}'
+            return b'{"answers": {"goal": {"choice": "information"}}}'
 
+    # A real question set is sent, because the route validates every typed
+    # answer against the questions it actually asked.
+    questions = {
+        "goal": {"type": "choice", "criteria": {"information": "", "understanding": "", "action": ""}},
+    }
     with patch.object(response_contract.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen:
-        response_contract._request_typesafe({"user_request": "hello"}, {"goal": {"type": "choice"}}, api_key="test-secret")
+        response_contract._request_typesafe({"user_request": "hello"}, questions, api_key="test-secret")
     request = urlopen.call_args.args[0]
     assert request.full_url == "https://api.typesafe.ai/v1/systemone"
     assert request.get_header("Authorization") == "Bearer test-secret"
@@ -108,8 +113,11 @@ def test_jev_request_prefers_openrouter_when_both_keys_are_available(monkeypatch
         def read(self):
             return b'{"answers": {"goal": {"choice": "information"}}}'
 
+    questions = {
+        "goal": {"type": "choice", "criteria": {"information": "", "understanding": "", "action": ""}},
+    }
     with patch.object(response_contract.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen:
-        result = response_contract._request_jev({"user_request": "hello"}, {"goal": {"type": "choice"}})
+        result = response_contract._request_jev({"user_request": "hello"}, questions)
 
     request = urlopen.call_args.args[0]
     payload = __import__("json").loads(request.data)
