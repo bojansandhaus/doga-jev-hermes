@@ -1,5 +1,5 @@
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import doga.__init__ as plugin
 
 
@@ -127,8 +127,12 @@ def test_on_transform_llm_output_memory_save():
     plugin._state._current_user_message = "what is the risk"
     with patch.object(plugin, "MNEMOSYNE_AVAILABLE", True), \
          patch.object(plugin, "remember", create=True) as mock_remember:
+        # The formatted output is asserted, not discarded: the transform must
+        # still return the formatted response.
         result = plugin._on_transform_llm_output(
             "<world_model>Information</world_model> answer"
         )
         mock_remember.assert_called_once()
+    assert result is not None
+    assert "Information" in result
     plugin._state.memory_enabled = False

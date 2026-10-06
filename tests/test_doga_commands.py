@@ -61,6 +61,9 @@ def test_manual():
     result = plugin._handle_doga("manual high")
     assert plugin._state.auto_depth is False
     assert plugin._state.depth == 5
+    # The reply names the level it applied, not just that a flag moved.
+    assert "manual high" in result
+    assert "5" in result
 
 
 def test_manual_no_arg():
@@ -77,6 +80,8 @@ def test_depth():
     result = plugin._handle_doga("depth 4")
     assert plugin._state.depth == 4
     assert plugin._state.auto_depth is False
+    assert "depth set to 4" in result
+    assert "manual mode" in result
 
 
 def test_depth_no_arg():
@@ -112,6 +117,7 @@ def test_hats_on():
     plugin._state.de_bono_enabled = False
     result = plugin._handle_doga("hats on")
     assert plugin._state.de_bono_enabled is True
+    assert "enabled" in result
 
 
 def test_hats_off():
@@ -119,6 +125,7 @@ def test_hats_off():
     result = plugin._handle_doga("hats off")
     assert plugin._state.de_bono_enabled is False
     assert plugin._state._active_hats == []
+    assert "disabled" in result
 
 
 def test_hats_no_arg():
@@ -129,6 +136,7 @@ def test_hats_no_arg():
 def test_max_recursion():
     result = plugin._handle_doga("max_recursion 5")
     assert plugin._state.max_recursion == 5
+    assert "max recursion set to 5" in result
 
 
 def test_max_recursion_no_arg():
@@ -152,12 +160,14 @@ def test_memory_on():
     with patch.object(plugin, "MNEMOSYNE_AVAILABLE", True):
         result = plugin._handle_doga("memory on")
     assert plugin._state.memory_enabled is True
+    assert "memory enabled" in result
 
 
 def test_memory_off():
     plugin._state.memory_enabled = True
     result = plugin._handle_doga("memory off")
     assert plugin._state.memory_enabled is False
+    assert "memory disabled" in result
 
 
 def test_memory_no_arg():

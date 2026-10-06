@@ -77,7 +77,14 @@ logger = logging.getLogger(__name__)
 _laya_lock = threading.RLock()
 _laya_failure_lock = threading.Lock()
 _laya_failure_count = 0
+# The documented cooldown, in consecutive local failures. It guards both
+# directions of the chain: a local-led chain stops calling the hosted side,
+# and a hosted-led chain stops calling the local slot.
 _LAYA_FALLBACK_FAILURE_LIMIT = 3
+# The ambiguity signal at or above which a contract becomes conditional, or
+# becomes a clarifying question. Named so the two comparisons in
+# build_contract cannot drift apart, and so the value is changed in one place.
+_CLARIFICATION_SIGNAL_THRESHOLD = 0.7
 _laya_agent: Any = None
 _laya_model: str | None = None
 QUESTIONS = {
@@ -238,6 +245,56 @@ def accepted_mode_names() -> str:
     return _ACCEPTED_MODES
 
 
+def _validate_typed_answers(
+    data: Any,
+    questions: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    """Check a response envelope and every typed answer it carries.
+
+    One validator for all three routes, because the wire contract is one wire
+    contract. It previously existed as three near-identical copies, and they had
+    already drifted: the Laya copy iterated its ``questions`` argument while the
+    Clef copy reached for the module-global ``QUESTIONS``. A provider therefore
+    got validation only against the question set its own caller happened to
+    pass, so the shipped default route validated nothing at all.
+
+    ``questions`` is the question set the caller asked, so a route can only ever
+    be checked against what it actually sent. ``label`` names the provider in the
+    message, because a bare "invalid response" does not say which route drifted.
+
+    Rejected, because each one means the provider's answer cannot be trusted to
+    mean what DOGA says it means:
+
+    - the payload is not a JSON object, or carries no ``answers`` object;
+    - a question has no answer, or the answer is not an object;
+    - a choice question whose choice is not one of its own criteria;
+    - a noul question whose score is a bool, is not a number, or falls outside
+      0 to 1 inclusive.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
+        raise RuntimeError(f"invalid {label} response: no answers object")
+    answers = data["answers"]
+    for name, question in questions.items():
+        criteria = question.get("criteria") if isinstance(question, dict) else None
+        kind = question.get("type") if isinstance(question, dict) else None
+        if kind not in ("choice", "noul") or not isinstance(criteria, dict):
+            # A question this validator cannot check would otherwise be skipped
+            # silently, so a malformed question spec is an error rather than a
+            # hole in the validation.
+            raise RuntimeError(f"invalid {label} question set: cannot validate {name!r}")
+        answer = answers.get(name)
+        if not isinstance(answer, dict):
+            raise RuntimeError(f"invalid {label} response: missing typed answer for {name!r}")
+        if kind == "choice" and answer.get("choice") not in criteria:
+            raise RuntimeError(f"invalid {label} response: unknown choice for {name!r}")
+        if kind == "noul":
+            score = answer.get("noul")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+                raise RuntimeError(f"invalid {label} response: invalid probability for {name!r}")
+    return data
+
+
 def _request_typesafe(state: dict[str, Any], questions: dict[str, Any], api_key: str | None = None) -> dict[str, Any]:
     key = api_key or os.environ.get("TYPESAFE_API_KEY")
     if not key:
@@ -250,9 +307,9 @@ def _request_typesafe(state: dict[str, Any], questions: dict[str, Any], api_key:
     except urllib.error.HTTPError as exc:
         detail = exc.read(2000).decode(errors="replace")
         raise RuntimeError(f"TypeSafe API returned HTTP {exc.code}: {detail}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
-        raise RuntimeError("TypeSafe API returned an invalid response")
-    return data
+    # Validated against the question set that was sent, not against the module
+    # global, so a partial question set cannot pass unvalidated.
+    return _validate_typed_answers(data, questions, "Jev")
 
 
 def _request_openrouter(state: dict[str, Any], questions: dict[str, Any], api_key: str | None = None) -> dict[str, Any]:
@@ -276,9 +333,7 @@ def _request_openrouter(state: dict[str, Any], questions: dict[str, Any], api_ke
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"OpenRouter API returned HTTP {exc.code}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
-        raise RuntimeError("OpenRouter API returned an invalid response")
-    return data
+    return _validate_typed_answers(data, questions, "Jev")
 
 
 def _request_jev(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
@@ -376,20 +431,7 @@ def _request_laya(state: dict[str, Any], questions: dict[str, Any]) -> dict[str,
             _laya_agent = _load_local_agent(model)
             _laya_model = model
         result = _laya_agent.predict(state, questions)
-    if not isinstance(result, dict) or not isinstance(result.get("answers"), dict):
-        raise RuntimeError("invalid local Laya response")
-    answers = result["answers"]
-    for name, question in questions.items():
-        answer = answers.get(name)
-        if not isinstance(answer, dict):
-            raise RuntimeError(f"invalid local Laya response: missing typed answer for {name!r}")
-        if question["type"] == "choice" and answer.get("choice") not in question["criteria"]:
-            raise RuntimeError(f"invalid local Laya response: unknown choice for {name!r}")
-        if question["type"] == "noul":
-            score = answer.get("noul")
-            if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
-                raise RuntimeError(f"invalid local Laya response: invalid probability for {name!r}")
-    return result
+    return _validate_typed_answers(result, questions, "local Laya")
 
 
 def _clef_checkpoint() -> str:
@@ -457,16 +499,9 @@ def _clef_result(data: Any) -> dict[str, Any]:
         answers = inner.get("answers") if isinstance(inner, dict) else None
     if not isinstance(answers, dict):
         raise RuntimeError("Cloudflare Workers AI returned an invalid response")
-    for name, question in QUESTIONS.items():
-        answer = answers.get(name)
-        if not isinstance(answer, dict):
-            raise RuntimeError(f"invalid Clef response: missing typed answer for {name!r}")
-        if question["type"] == "choice" and answer.get("choice") not in question["criteria"]:
-            raise RuntimeError(f"invalid Clef response: unknown choice for {name!r}")
-        if question["type"] == "noul":
-            score = answer.get("noul")
-            if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
-                raise RuntimeError(f"invalid Clef response: invalid probability for {name!r}")
+    # Validated against the module-global question set, which is what Clef is
+    # always asked, rather than a caller-supplied one that could be partial.
+    _validate_typed_answers({"answers": answers}, QUESTIONS, "Clef")
     return {**data, "answers": answers, "_doga_provider": "clef"}
 
 
@@ -528,9 +563,11 @@ def _evaluate_chain(resolved: Mode, user_message: str) -> dict[str, Any]:
 
     The only trigger is the leading call raising. A single-provider mode has no
     chain at all, so a failure in ``api_only`` or ``local_only`` is reported and
-    never rerouted. The local-to-API chain keeps the existing cooldown: after
-    three consecutive local failures the API side is no longer called in this
-    process until a local evaluation succeeds.
+    never rerouted. Both two-provider directions share one cooldown: after
+    ``_LAYA_FALLBACK_FAILURE_LIMIT`` consecutive local failures the other
+    provider is no longer called in this process until a local evaluation
+    succeeds. The counter counts local failures whichever side led, so a local
+    engine that is failing is not re-paid its load cost on every request.
     """
     global _laya_failure_count
     lead, backup = resolved.providers
@@ -552,17 +589,57 @@ def _evaluate_chain(resolved: Mode, user_message: str) -> dict[str, Any]:
             _laya_failure_count = 0
         return local
     # The API leads. It has never been rerouted to another hosted provider, so
-    # the only remaining provider is the local slot.
+    # the only remaining provider is the local slot. The local slot carries the
+    # same cooldown as the other direction, so a failing engine is not loaded and
+    # retried on every subsequent request: once the documented number of
+    # consecutive local failures is reached, the slot is not called again in
+    # this process.
+    with _laya_failure_lock:
+        # Reached means the limit has already been spent, so the slot is skipped
+        # rather than paying its load cost one more time.
+        local_retry_exhausted = _laya_failure_count >= _LAYA_FALLBACK_FAILURE_LIMIT
     try:
         hosted = _request_by_provider(lead)(state=state, questions=QUESTIONS)
     except Exception as exc:
         logger.warning("DOGA hosted API failed (%s); trying the local model", type(exc).__name__)
-        local = _request_by_provider("laya")(state=state, questions=QUESTIONS)
+        if local_retry_exhausted:
+            # The hosted failure is still the error to report. Suppressing the
+            # retry must not turn a reported failure into a silent one, so the
+            # local failure that would have been re-paid is not attempted. The
+            # counter still advances, so a suppressed run stays visible.
+            with _laya_failure_lock:
+                _laya_failure_count += 1
+            logger.warning(
+                "DOGA local fallback suppressed after repeated local failures (count %d)",
+                _laya_failure_count,
+            )
+            raise
+        try:
+            local = _request_by_provider("laya")(state=state, questions=QUESTIONS)
+        except Exception:
+            with _laya_failure_lock:
+                _laya_failure_count += 1
+            raise
+        with _laya_failure_lock:
+            _laya_failure_count = 0
         return {**local, "_doga_provider": "laya_fallback"}
+    with _laya_failure_lock:
+        _laya_failure_count = 0
     return hosted
 
 
 def build_contract(response: dict[str, Any]) -> dict[str, Any]:
+    """Build a contract from typed answers, falling back on anything untrusted.
+
+    Reachable with a hand-built or legacy Jev dict as well as with a validated
+    provider response, so every value is checked here rather than assumed. A
+    choice outside its own criteria falls back to the safe default. An
+    out-of-range or non-numeric noul score is treated as no signal at all
+    rather than as a high or a low one: a score of 99 is not strong evidence of
+    ambiguity, and honouring it would make a broken provider look like a
+    confident one. Both Laya and Clef reject such a score at the provider edge,
+    and this closes the same hole on the path they do not cover.
+    """
     answers = response.get("answers", {}) if isinstance(response, dict) else {}
 
     def choice(name: str, allowed: set[str], fallback: str) -> str:
@@ -580,14 +657,17 @@ def build_contract(response: dict[str, Any]) -> dict[str, Any]:
         if isinstance(clarification_answer, dict)
         else 0
     )
+    # A probability is only a signal inside 0 to 1 inclusive. Anything else,
+    # including a bool, is a malformed answer and reads as no signal.
     clarification_score = (
         raw_clarification
         if isinstance(raw_clarification, (int, float))
         and not isinstance(raw_clarification, bool)
+        and 0 <= raw_clarification <= 1
         else 0
     )
-    ask = mode == "clarify" and clarification_score >= 0.7
-    conditional = clarification_score >= 0.7 and not ask
+    ask = mode == "clarify" and clarification_score >= _CLARIFICATION_SIGNAL_THRESHOLD
+    conditional = clarification_score >= _CLARIFICATION_SIGNAL_THRESHOLD and not ask
     elements: list[str] = []
     if mode == "recommend" or goal == "action":
         elements.extend(["recommendation", "next_step"])
