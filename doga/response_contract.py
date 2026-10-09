@@ -192,8 +192,28 @@ def _local_model_usable() -> bool:
     ``auto`` needs this: it must pick the local side only when a local model is
     present. A missing import or an unset engine name is answered without
     importing the engine, because ``auto`` is resolved once at plugin start.
+
+    A malformed ``DOGA_LOCAL_MODEL`` answers False too. ``local_model()`` raises
+    ``RuntimeError`` for an empty or ill-formed engine id, and this call used to
+    be unguarded, so ``DOGA_DECISION_MODE=auto`` with an unusable value made
+    ``import doga`` raise at module scope — ``_apply_mode`` catches only
+    ``ModeError`` — and every slash command with it. A bad local model name is a
+    reason to route hosted; it is not a reason the plugin cannot load.
+
+    The trade-off is deliberate and worth stating: a misconfiguration degrades
+    instead of erroring, which means it is quiet. It is logged rather than
+    swallowed so it is not invisible.
     """
-    if not local_model().strip():
+    try:
+        if not local_model().strip():
+            return False
+    except RuntimeError as exc:
+        logger.warning(
+            "local decision route unavailable: %s; %s resolves to %s",
+            exc,
+            "DOGA_DECISION_MODE",
+            API_ONLY,
+        )
         return False
     try:
         import laya  # noqa: F401

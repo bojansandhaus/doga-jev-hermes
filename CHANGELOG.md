@@ -1,4 +1,17 @@
 # Changelog
+## v1.5.0 (2026-10-09)
+
+Two ways the plugin failed hard on ordinary bad input. Full notes: [RELEASE_NOTES_v1.5.0.md](RELEASE_NOTES_v1.5.0.md).
+
+### Fixed
+
+- **The world-model regex took 18.7 seconds on one malformed reply.** `<world_model>\s*(.*?)\s*</world_model>` backtracked on an unclosed tag: 400 sp = 39 ms, 800 = 310 ms, 1600 = 2.42 s, 3200 = 18.7 s, eight for one doubling. This ran on every assistant response, so a truncated reply was an 18-second hang. Both `\s*` are dropped; the captured text is unchanged because the caller already strips. `_FALLBACK_WM_RE` was measured and left alone — it costs 0.01 ms on the same inputs.
+- **`DOGA_DECISION_MODE=auto` with an unusable local model broke `import doga`.** `_local_model_usable()` called `local_model()` unguarded, and `_apply_mode` catches only `ModeError`, so an empty or ill-formed `DOGA_LOCAL_MODEL` raised `RuntimeError` at module scope and took every slash command with it. A malformed model name now answers `False`, so `auto` resolves to the hosted route and the plugin loads. The degradation is logged rather than swallowed, which is the stated trade-off: quiet beats unloadable.
+
+### Added
+
+- `tests/test_hard_input_regressions.py`, 15 tests pinning both fixes: the quadratic shape rather than only a ceiling, captured-text equivalence on three shapes including interior newlines, extraction on zero/one/two blocks, the unclosed-tag fallback keeping its content, the import surviving four malformed model values, the warning naming the variable, and two guards against over-correction.
+
 
 ## v1.4.1 (2026-10-04)
 
