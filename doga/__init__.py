@@ -23,6 +23,10 @@ from . import response_contract
 
 logger = logging.getLogger(__name__)
 
+# Marks a turn whose status has not been recorded yet, so "no outcome yet" is
+# never confused with the string an outcome would be.
+_UNSET = object()
+
 # Optional Mnemosyne memory backend
 try:
     from mnemosyne import remember, recall
@@ -46,12 +50,22 @@ except ImportError:
 class _PluginState:
     """Mutable plugin settings, adjustable via /doga slash command.
 
-    Global settings (enabled, depth, etc.) are shared across sessions.
-    Per-turn state (_recursion_depth, etc.) is thread-local to prevent
-    cross-session contamination in concurrent conversation handling.
+    Global settings (enabled, depth, etc.) are shared across sessions, so every
+    write to them is taken under ``_write_lock``: a slash command can land on
+    another session's thread while that thread is mid-turn, and an unsynchronised
+    read-modify-write of the mode state would interleave into a half-applied
+    mode. ``_last_jev_status`` is per-turn and keyed by the turn that produced
+    it, so one session's status cannot report another session's outcome.
     """
 
     def __init__(self):
+        self._write_lock = threading.Lock()
+        # Per-turn response-contract status. The turn is the key, so the outcome
+        # a slash command reports is the one this thread produced, rather than
+        # whichever turn happened to write last.
+        self._status_lock = threading.Lock()
+        self._status_local = threading.local()
+        self._status_latest: str = "enabled"
         self.enabled: bool = True
         self.auto_depth: bool = True
         self.depth: int = 3
@@ -71,6 +85,62 @@ class _PluginState:
         self.de_bono_enabled: bool = True
         self.max_recursion: int = 3
         self._local = threading.local()
+
+    @property
+    def _last_jev_status(self) -> str:
+        """The outcome of the most recent response-contract attempt for this turn.
+
+        Held per turn and written under a lock. A slash command on one session's
+        thread reports that session's outcome; without this, ``/doga status``
+        on a quiet session reported whatever a concurrent session last wrote,
+        which is the race this closes. A thread with no turn of its own — a
+        status request that carries no turn — reports the last attempt in the
+        process, which is the closest honest answer available to it.
+        """
+        own = getattr(self._status_local, "value", _UNSET)
+        if own is not _UNSET:
+            return own
+        with self._status_lock:
+            return self._status_latest
+
+    @_last_jev_status.setter
+    def _last_jev_status(self, value: str) -> None:
+        with self._status_lock:
+            self._status_local.value = value
+            self._status_latest = value
+
+    def _reset_turn_status(self) -> None:
+        """Start this thread's turn with no outcome recorded.
+
+        Called from ``pre_llm_call``, so the status a turn reports is the one it
+        produced. Clearing to the empty marker rather than to a previous turn's
+        value matters: without it a failed turn's ``error`` outlived the turn
+        that failed and was reported as this one's outcome.
+        """
+        with self._status_lock:
+            self._status_local.value = "enabled"
+
+    def reset_recursion_stop(self) -> None:
+        """Clear this turn's recursion stop latch and its ignored-stop count.
+
+        Called when the limit changes. Both are set against the limit that was
+        in force, so leaving them in place would make a raised limit take
+        effect only from the next turn.
+        """
+        with self._write_lock:
+            self._stop_sent = False
+            self._stop_count = 0
+
+    def set(self, **settings: Any) -> None:
+        """Write global settings together, under the plugin lock.
+
+        A slash command can land on another session's thread while that thread
+        is mid-turn, so the fields are committed as one change rather than one
+        at a time, and a concurrent reader cannot observe half a new setting.
+        """
+        with self._write_lock:
+            for name, value in settings.items():
+                setattr(self, name, value)
 
     def _resolve_startup_mode(self) -> None:
         """Pick the startup mode from the environment, newest setting first.
@@ -106,39 +176,73 @@ class _PluginState:
         ``DOGA_DECISION_MODE`` has to surface as an invalid mode, while a
         rejected ``/doga mode`` from a user must simply leave the current mode
         untouched and be reported as a usage error.
+
+        The whole read-modify-write is taken under ``_write_lock``. The mode,
+        the hosted pin and the fallback flag are read to compute the next value
+        and written together, so a slash command landing on another session's
+        thread mid-update cannot observe or commit a half-applied mode.
         """
         try:
-            resolved = response_contract.resolve_mode(name, hosted=self._hosted)
+            with self._write_lock:
+                resolved = response_contract.resolve_mode(name, hosted=self._hosted)
+                # A spelling that names a hosted provider pins it *before* the
+                # fallback re-resolution below, because that re-resolution
+                # resolves an unqualified canonical name against ``_hosted``.
+                # Applying the pin afterwards left ``/doga provider clef``
+                # reporting ``api_only`` while routing to the default vendor.
+                pinned = next(
+                    (p for p in resolved.providers if p in response_contract.HOSTED_PROVIDERS),
+                    None,
+                )
+                if pinned is not None:
+                    self._hosted = pinned
+                if fallback is not None:
+                    # An explicit fallback flag overrides what the spelling implied, so
+                    # the legacy provider plus fallback pair lands on the mode that
+                    # actually has that chain. Without this, ``provider=laya`` with the
+                    # fallback flag set would report local_only while routing as a chain.
+                    side_leads_local = resolved.providers[0] == response_contract.LOCAL_PROVIDER
+                    if side_leads_local:
+                        resolved = response_contract.resolve_mode(
+                            response_contract.LOCAL_WITH_API_FALLBACK if fallback
+                            else response_contract.LOCAL_ONLY, hosted=self._hosted)
+                    else:
+                        resolved = response_contract.resolve_mode(
+                            response_contract.API_WITH_LOCAL_FALLBACK if fallback
+                            else response_contract.API_ONLY, hosted=self._hosted)
+                # A pin that the new mode cannot use is cleared here rather than
+                # silently carried: leaving ``clef`` pinned on ``local_only``
+                # would leave exactly one session away from routing every
+                # request to a vendor the current mode says is not in play.
+                resolved_providers = resolved.providers
+                hosted_in_chain = next(
+                    (p for p in resolved_providers if p in response_contract.HOSTED_PROVIDERS),
+                    None,
+                )
+                if hosted_in_chain is not None:
+                    self._hosted = hosted_in_chain
+                else:
+                    # No hosted provider is in play, so a pin from an earlier
+                    # API-led selection is dropped rather than kept in reserve:
+                    # a silent pin that comes back on the next API-led selection
+                    # is a vendor nobody asked for on this one.
+                    self._hosted = response_contract.DEFAULT_HOSTED
+                self._mode = resolved.name
+                self._mode_valid = True
+                # Remember which hosted provider an API-led mode resolved to, so the
+                # next mode selection that does not pin one keeps that provider.
+                if fallback is None:
+                    fallback = (
+                        len(resolved_providers) > 1
+                        and resolved.fallback in response_contract.HOSTED_PROVIDERS
+                    )
+                self._fallback = fallback
         except response_contract.ModeError:
             if not strict:
                 return False
             self._mode = str(name)
             self._mode_valid = False
             return False
-        if fallback is not None:
-            # An explicit fallback flag overrides what the spelling implied, so
-            # the legacy provider plus fallback pair lands on the mode that
-            # actually has that chain. Without this, ``provider=laya`` with the
-            # fallback flag set would report local_only while routing as a chain.
-            side_leads_local = resolved.providers[0] == response_contract.LOCAL_PROVIDER
-            if side_leads_local:
-                resolved = response_contract.resolve_mode(
-                    response_contract.LOCAL_WITH_API_FALLBACK if fallback
-                    else response_contract.LOCAL_ONLY, hosted=self._hosted)
-            else:
-                resolved = response_contract.resolve_mode(
-                    response_contract.API_WITH_LOCAL_FALLBACK if fallback
-                    else response_contract.API_ONLY, hosted=self._hosted)
-        self._mode = resolved.name
-        self._mode_valid = True
-        # Remember which hosted provider an API-led mode resolved to, so the
-        # next mode selection that does not pin one keeps that provider.
-        for provider in resolved.providers:
-            if provider in response_contract.HOSTED_PROVIDERS:
-                self._hosted = provider
-        if fallback is None:
-            fallback = len(resolved.providers) > 1 and resolved.fallback in response_contract.HOSTED_PROVIDERS
-        self._fallback = fallback
         return True
 
     @property
@@ -303,6 +407,7 @@ def _on_pre_llm_call(
     _state._reasoning_stack = []
     _state._stop_sent = False
     _state._stop_count = 0
+    _state._reset_turn_status()
 
     _state._current_user_message = user_message
 
@@ -362,6 +467,34 @@ def _on_pre_llm_call(
     return {"context": guide}
 
 
+def _detect_goal_type(text: str) -> str:
+    """Read the taxonomy word the model picked, from the block it picked it in.
+
+    Anchored to an extracted ``<world_model>`` block rather than searched for
+    anywhere in the cleaned text. The taxonomy words — Information,
+    Understanding, Action — also appear in the injected guidance, in an echoed
+    question, and in ordinary prose, so an unanchored search attributed the
+    goal of whatever sentence happened to come first to every later turn in
+    Mnemosyne. With no block, or no goal statement inside one, the answer is
+    ``unknown``: the goal was not stated, which is what memory should record.
+
+    Extraction is the same one the formatter uses, so both read one block the
+    same way, and a goal can never be read out of text the formatter strips.
+    """
+    blocks, _ = output_formatter._extract_world_model(text)
+    if not blocks:
+        return "unknown"
+    hit = re.search(
+        r"goal[^.\n]{0,80}?\b(Information|Understanding|Action)\b|"
+        r"\b(Information|Understanding|Action)\b\s*[—:-]",
+        blocks[0],
+        re.IGNORECASE,
+    )
+    if not hit:
+        return "unknown"
+    return (hit.group(1) or hit.group(2)).lower()
+
+
 def _on_transform_llm_output(
     response_text: str = "",
     **_: Any,
@@ -381,12 +514,7 @@ def _on_transform_llm_output(
     # Save detected goal pattern to Mnemosyne if available
     if MNEMOSYNE_AVAILABLE and _state.memory_enabled and _state._current_user_message:
         try:
-            m = re.search(
-                r"<world_model>.*?(Information|Understanding|Action)",
-                cleaned_for_goal,
-                re.DOTALL | re.IGNORECASE,
-            )
-            goal_type = m.group(1).lower() if m else "unknown"
+            goal_type = _detect_goal_type(cleaned_for_goal)
             remember(
                 content=_state._current_user_message,
                 importance=0.7,
@@ -490,6 +618,28 @@ _SIMULATE_SCHEMA = {
 }
 
 
+def _bounded_iterations(value: Any) -> Optional[int]:
+    """Clamp a requested ``n_iterations`` to the schema's declared bounds.
+
+    The schema declares ``minimum: 100`` and ``maximum: 50000`` and the model
+    layer does not enforce either, so the handler enforces both. A value above
+    the maximum is clamped, because a larger request is the same request done
+    more expensively. A value below the minimum is rejected, because it cannot
+    be clamped into meaning: one iteration yields probability 1.0 for whatever
+    that iteration sampled, and zero or a negative count divides by zero or
+    yields a negative ``total_iterations``. A non-integer is rejected for the
+    same reason: a float silently floors, and a string does not.
+
+    Returns ``None`` when the value must be refused rather than clamped.
+    """
+    minimum, maximum = 100, 50000
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < minimum:
+        return None
+    return min(value, maximum)
+
+
 def _simulate_tool_handler(args: Any, **kwargs: Any) -> str:
     """Handle the simulate tool call."""
     if _state._stop_sent:
@@ -500,7 +650,19 @@ def _simulate_tool_handler(args: Any, **kwargs: Any) -> str:
         except (json.JSONDecodeError, TypeError):
             return json.dumps({"error": "Invalid tool arguments: expected JSON object."})
     scenarios = args.get("scenarios", [])
-    n_iterations = min(args.get("n_iterations", 10000), 50000)
+    n_iterations = _bounded_iterations(args.get("n_iterations", 10000))
+    if n_iterations is None:
+        # The documented shape is an error, because the schema declares the
+        # bounds. Silently clamping would run a one-sample "simulation" that
+        # reports probability 1.0 for whatever the single sample picked, or a
+        # negative iteration count that the engine happily divides by.
+        return json.dumps({
+            "error": "n_iterations must be an integer between 100 and 50000.",
+        })
+
+    # Cap scenarios
+    if len(scenarios) > _state.max_scenarios:
+        scenarios = scenarios[:_state.max_scenarios]
 
     # Cap scenarios
     if len(scenarios) > _state.max_scenarios:
@@ -558,7 +720,16 @@ _REASON_DEEPER_SCHEMA = {
 
 
 def _reason_deeper_handler(args: Any, **kwargs: Any) -> str:
-    """Handle reason_deeper tool call — triggers next recursion level."""
+    """Handle reason_deeper tool call — triggers next recursion level.
+
+    A stop is enforced twice and neither half is a hard guarantee. ``_stop_sent``
+    gates ``simulate`` and ``reason_deeper`` from the first ignored stop, which
+    is what actually ends a turn. ``hard_break`` on the third ignored stop is
+    advisory only — a stronger wording of the same instruction, not a different
+    mechanism, and the model decides whether to keep calling. Nothing here can
+    force the loop closed; the real backstop is Hermes' own ``max_iterations``
+    on the tool-calling loop.
+    """
     if not isinstance(args, dict):
         try:
             args = json.loads(args) if isinstance(args, str) else {}
@@ -669,11 +840,11 @@ def _handle_doga(raw_args: str) -> Optional[str]:
     sub = argv[0].lower()
 
     if sub == "on":
-        _state.enabled = True
+        _state.set(enabled=True)
         return "DOGA thinking enabled."
 
     if sub == "off":
-        _state.enabled = False
+        _state.set(enabled=False)
         return "DOGA thinking disabled."
 
     if sub == "status":
@@ -683,11 +854,14 @@ def _handle_doga(raw_args: str) -> Optional[str]:
         else:
             mode = f"manual (depth: {_state.depth}/5)"
         hat_status = "enabled" if _state.de_bono_enabled else "disabled"
+        # The resolved provider is named, not only the mode. ``api_only`` is
+        # silent about which vendor it means, and a mode that silently stays on
+        # a pinned vendor is one way every request goes to a second paid route.
         return (
             "DOGA status:\n"
             f"  Enabled: {_state.enabled}\n"
             f"  Mode: {mode}\n"
-            f"  Response contracts: {'enabled' if _state.jev_enabled else 'disabled'} (mode: {_state.decision_mode}, last: {_state._last_jev_status})\n"
+            f"  Response contracts: {'enabled' if _state.jev_enabled else 'disabled'} (mode: {_state.decision_mode}, provider: {_state.decision_provider}, last: {_state._last_jev_status})\n"
             f"  Local model: {_state.local_model_name()}\n"
             f"  Show simulation: {_state.show_simulation}\n"
             f"  Max scenarios: {_state.max_scenarios}\n"
@@ -697,7 +871,7 @@ def _handle_doga(raw_args: str) -> Optional[str]:
         )
 
     if sub == "auto":
-        _state.auto_depth = True
+        _state.set(auto_depth=True)
         return f"DOGA set to auto mode (complexity: {_state._last_complexity})."
 
     if sub == "manual":
@@ -707,8 +881,7 @@ def _handle_doga(raw_args: str) -> Optional[str]:
         mapping = {"low": 1, "medium": 3, "high": 5}
         if level not in mapping:
             return "Level must be low, medium, or high."
-        _state.auto_depth = False
-        _state.depth = mapping[level]
+        _state.set(auto_depth=False, depth=mapping[level])
         return f"DOGA set to manual {level} (depth: {_state.depth}/5)."
 
     if sub == "depth":
@@ -718,18 +891,17 @@ def _handle_doga(raw_args: str) -> Optional[str]:
             d = int(argv[1])
             if d < 1 or d > 5:
                 return "Depth must be between 1 and 5."
-            _state.auto_depth = False
-            _state.depth = d
+            _state.set(auto_depth=False, depth=d)
             return f"DOGA depth set to {d}/5 (manual mode)."
         except ValueError:
             return "Invalid number. Use /doga depth <1-5>."
 
     if sub == "show":
-        _state.show_simulation = True
+        _state.set(show_simulation=True)
         return "DOGA simulation panel will be shown in responses."
 
     if sub == "hide":
-        _state.show_simulation = False
+        _state.set(show_simulation=False)
         return "DOGA simulation panel hidden. Only final answer will be shown."
 
     if sub == "hats":
@@ -737,10 +909,10 @@ def _handle_doga(raw_args: str) -> Optional[str]:
             return f"De Bono hats: {'enabled' if _state.de_bono_enabled else 'disabled'}\nUsage: /doga hats on|off"
         h = argv[1].lower()
         if h == "on":
-            _state.de_bono_enabled = True
+            _state.set(de_bono_enabled=True)
             return "De Bono parallel thinking hats enabled."
         elif h == "off":
-            _state.de_bono_enabled = False
+            _state.set(de_bono_enabled=False)
             _state._active_hats = []
             return "De Bono parallel thinking hats disabled."
         return "Usage: /doga hats on|off"
@@ -752,7 +924,12 @@ def _handle_doga(raw_args: str) -> Optional[str]:
             r = int(argv[1])
             if r < 1 or r > 5:
                 return "Max recursion must be between 1 and 5."
-            _state.max_recursion = r
+            # The stop latch is keyed to the limit that set it, so raising the
+            # limit has to clear it: a latch left over from the old, lower limit
+            # kept gating ``simulate`` and ``reason_deeper`` for the rest of the
+            # turn, which made the new limit take effect only on the next turn.
+            _state.reset_recursion_stop()
+            _state.set(max_recursion=r)
             return f"DOGA max recursion set to {r}."
         except ValueError:
             return "Invalid number. Use /doga max_recursion <1-5>."
@@ -764,7 +941,10 @@ def _handle_doga(raw_args: str) -> Optional[str]:
         if not _state._apply_mode(argv[1], strict=False):
             return _MODE_USAGE
         _state._last_jev_status = "enabled"
-        return f"DOGA response contract mode: {_state.decision_mode}."
+        return (
+            f"DOGA response contract mode: {_state.decision_mode} "
+            f"(provider: {_state.decision_provider})."
+        )
 
     if sub == "provider":
         if len(argv) != 2 or argv[1].lower() not in response_contract.PROVIDERS:
@@ -773,7 +953,10 @@ def _handle_doga(raw_args: str) -> Optional[str]:
         if not _state._apply_mode(argv[1].lower(), fallback=False, strict=False):
             return "Usage: /doga provider " + "|".join(response_contract.PROVIDERS)
         _state._last_jev_status = "enabled"
-        return f"DOGA response contract mode: {_state.decision_mode}."
+        return (
+            f"DOGA response contract mode: {_state.decision_mode} "
+            f"(provider: {_state.decision_provider})."
+        )
 
     if sub == "fallback":
         if len(argv) != 2 or argv[1].lower() not in {"on", "off"}:
@@ -784,18 +967,21 @@ def _handle_doga(raw_args: str) -> Optional[str]:
         if not _state._apply_mode(response_contract.LOCAL_PROVIDER,
                                  fallback=argv[1].lower() == "on", strict=False):
             return "Usage: /doga fallback on|off"
-        return f"DOGA response contract mode: {_state.decision_mode}."
+        return (
+            f"DOGA response contract mode: {_state.decision_mode} "
+            f"(provider: {_state.decision_provider})."
+        )
 
     if sub == "jev":
         if len(argv) < 2:
             return f"Jev: {'enabled' if _state.jev_enabled else 'disabled'}\nUsage: /doga jev on|off"
         setting = argv[1].lower()
         if setting == "on":
-            _state.jev_enabled = True
+            _state.set(jev_enabled=True)
             _state._last_jev_status = "enabled"
             return "DOGA response contracts enabled."
         if setting == "off":
-            _state.jev_enabled = False
+            _state.set(jev_enabled=False)
             _state._last_jev_status = "disabled"
             return "DOGA response contracts disabled."
         return "Usage: /doga jev on|off"
@@ -807,10 +993,10 @@ def _handle_doga(raw_args: str) -> Optional[str]:
         if m == "on":
             if not MNEMOSYNE_AVAILABLE:
                 return "Mnemosyne is not installed. Run: pip install mnemosyne-memory"
-            _state.memory_enabled = True
+            _state.set(memory_enabled=True)
             return "DOGA goal memory enabled."
         elif m == "off":
-            _state.memory_enabled = False
+            _state.set(memory_enabled=False)
             return "DOGA goal memory disabled."
         return "Usage: /doga memory on|off"
 

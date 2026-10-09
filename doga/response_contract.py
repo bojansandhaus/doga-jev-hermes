@@ -56,11 +56,11 @@ LOCAL_MODEL_ENV = "DOGA_LOCAL_MODEL"
 # A local engine name is either a bare engine id or a Hugging Face style
 # ``namespace/name``. Both are accepted verbatim and never mapped, because the
 # point of the slot is that an unlisted engine works without a code change.
-# Anything outside this shape is rejected: a name carrying whitespace, quotes,
-# a backslash, a control character, or a stray separator would corrupt the JSON
-# body it is embedded in or a URL path segment it is interpolated into.
-# Dots are allowed, because real engine ids carry them, such as
-# ``jeff-qwen3.5-0.8b``.
+# Anything outside this shape is rejected: a name carrying whitespace, quotes, a
+# backslash, or a control character would not be a usable engine identifier, and
+# the value is split on ``/`` before it is handed to the runtime, so a stray
+# separator would turn one name into two. Dots are allowed, because real engine
+# ids carry them, such as ``jeff-qwen3.5-0.8b``.
 _LOCAL_MODEL_PATTERN = re.compile(r"\A[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
 # Clef is Cloudflare-hosted. The endpoint is per account, so the account ID is a
 # required part of the URL rather than an optional setting.
@@ -186,6 +186,19 @@ class ModeError(ValueError):
     """An unknown mode name. The message lists every accepted spelling."""
 
 
+class AnswerValidationError(RuntimeError):
+    """A route answered 200 OK and its typed answers cannot be trusted.
+
+    Distinct from a transport failure, because the two demand opposite
+    responses. A transport failure is what the fallback exists for: the
+    request did not reach a working model, so trying the other route is the
+    point. A 200 with invalid choices means the request was already paid for
+    and the answer is unusable, so the fallback would spend a second time to
+    get a second answer of equally unknown provenance. Callers must let this
+    escalate rather than fall through.
+    """
+
+
 def _local_model_usable() -> bool:
     """Whether the local slot can actually load, judged without importing it.
 
@@ -293,7 +306,7 @@ def _validate_typed_answers(
       0 to 1 inclusive.
     """
     if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
-        raise RuntimeError(f"invalid {label} response: no answers object")
+        raise AnswerValidationError(f"invalid {label} response: no answers object")
     answers = data["answers"]
     for name, question in questions.items():
         criteria = question.get("criteria") if isinstance(question, dict) else None
@@ -302,16 +315,16 @@ def _validate_typed_answers(
             # A question this validator cannot check would otherwise be skipped
             # silently, so a malformed question spec is an error rather than a
             # hole in the validation.
-            raise RuntimeError(f"invalid {label} question set: cannot validate {name!r}")
+            raise AnswerValidationError(f"invalid {label} question set: cannot validate {name!r}")
         answer = answers.get(name)
         if not isinstance(answer, dict):
-            raise RuntimeError(f"invalid {label} response: missing typed answer for {name!r}")
+            raise AnswerValidationError(f"invalid {label} response: missing typed answer for {name!r}")
         if kind == "choice" and answer.get("choice") not in criteria:
-            raise RuntimeError(f"invalid {label} response: unknown choice for {name!r}")
+            raise AnswerValidationError(f"invalid {label} response: unknown choice for {name!r}")
         if kind == "noul":
             score = answer.get("noul")
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
-                raise RuntimeError(f"invalid {label} response: invalid probability for {name!r}")
+                raise AnswerValidationError(f"invalid {label} response: invalid probability for {name!r}")
     return data
 
 
@@ -325,8 +338,11 @@ def _request_typesafe(state: dict[str, Any], questions: dict[str, Any], api_key:
         with urllib.request.urlopen(request, timeout=8) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        detail = exc.read(2000).decode(errors="replace")
-        raise RuntimeError(f"TypeSafe API returned HTTP {exc.code}: {detail}") from exc
+        # The status only. The body is an upstream error page, and an upstream
+        # error page is exactly where a DSN, a signed URL, or an account
+        # identifier shows up; OpenRouter and Clef already log this way and the
+        # repo's own documentation claims error-type-only logging.
+        raise RuntimeError(f"TypeSafe API returned HTTP {exc.code}") from exc
     # Validated against the question set that was sent, not against the module
     # global, so a partial question set cannot pass unvalidated.
     return _validate_typed_answers(data, questions, "Jev")
@@ -357,7 +373,15 @@ def _request_openrouter(state: dict[str, Any], questions: dict[str, Any], api_ke
 
 
 def _request_jev(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
-    """Use OpenRouter first, then direct TypeSafe if the primary route fails."""
+    """Use OpenRouter first, then direct TypeSafe if the primary route fails.
+
+    The second call is paid for, so what counts as "failed" is the whole
+    question. Only a transport failure qualifies: the request never reached a
+    model that could answer it. A 200 response whose typed answers are unusable
+    is not that — it is a completed, billed call that came back untrustworthy,
+    and repeating the same payload to a second vendor buys another answer of
+    equally unknown provenance. Such a rejection propagates instead.
+    """
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     typesafe_key = os.environ.get("TYPESAFE_API_KEY")
     errors: list[str] = []
@@ -365,12 +389,16 @@ def _request_jev(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, 
     if openrouter_key:
         try:
             return _request_openrouter(state, questions, api_key=openrouter_key)
+        except AnswerValidationError:
+            raise
         except Exception as exc:
             errors.append(f"OpenRouter request failed: {exc}")
 
     if typesafe_key:
         try:
             return _request_typesafe(state, questions, api_key=typesafe_key)
+        except AnswerValidationError:
+            raise
         except Exception as exc:
             errors.append(f"TypeSafe fallback failed: {exc}")
 
@@ -382,16 +410,22 @@ def _request_jev(state: dict[str, Any], questions: dict[str, Any]) -> dict[str, 
 
 
 def local_model() -> str:
-    """The local engine name sent to the local server, defaulting to Laya.
+    """The local engine name handed to the in-process runtime, defaulting to Laya.
 
     ``DOGA_LOCAL_MODEL`` is the generic slot selector. The value is passed
     through verbatim: it is not checked against a list of known models, because
     a new local engine must work without a code change. What is rejected is a
     value that could not be used safely, namely an empty or whitespace-only
-    name, or one carrying a character that would corrupt the JSON body it is
-    embedded in or a URL path segment it is interpolated into. That is a
-    character check rather than a name check, so it rejects garbage without
-    rejecting an engine nobody has heard of.
+    name, or one carrying a character that would corrupt the identifier it is
+    split on. That is a character check rather than a name check, so it rejects
+    garbage without rejecting an engine nobody has heard of.
+
+    The only consumer is :func:`_load_local_agent`, which calls ``laya.load(name)``
+    inside the Hermes process. There is no local server and no request body, so
+    nothing is interpolated into a URL or into JSON: the engine name is one
+    Python argument. The ``.`` and ``..`` segments are rejected because the
+    value is split on ``/`` and such a segment would climb out of that split,
+    not because any URL is built from it.
 
     An unset variable takes the default. A variable that is set but empty is an
     error rather than a silent default, so a misconfigured value surfaces
@@ -413,8 +447,8 @@ def local_model() -> str:
         )
     if any(segment in {".", ".."} for segment in name.split("/")):
         # Dots are legal inside a segment, so a whole '.' or '..' segment is
-        # what is rejected: the name would otherwise climb out of the path it
-        # is interpolated into.
+        # what is rejected: the value would otherwise climb out of the split it
+        # is handed to as one identifier.
         raise RuntimeError(f"{LOCAL_MODEL_ENV} must not contain a '.' or '..' path segment")
     return name
 

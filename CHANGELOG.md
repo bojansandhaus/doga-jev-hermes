@@ -1,4 +1,25 @@
 # Changelog
+## v1.6.0 (2026-10-09)
+
+Eight findings from a review of the fork, on paths the happy-path tests do not reach. Full notes: [RELEASE_NOTES_v1.6.0.md](RELEASE_NOTES_v1.6.0.md).
+
+### Fixed
+
+- **A rejected answer bought a second billed call.** `_request_jev` wrapped both routes in `except Exception`, so a 200-OK-with-unusable-choices from OpenRouter — which `_validate_typed_answers` rejects on purpose — was treated as a transport failure and the same user payload was sent to TypeSafe. Rejections now raise a distinct `AnswerValidationError` and escalate; transport failures still fall through. A subclass of `RuntimeError`, so every existing caller and test is unaffected.
+- **The TypeSafe error message interpolated 2,000 bytes of upstream response body** into the raised error, which is where an internal DSN or signed URL appears. OpenRouter and Cloudflare already log the status only, and the repo's own documentation claims error-type-only logging; the body is no longer read, so the claim holds for all three routes.
+- **The schema declared `n_iterations` minimum 100 and nothing enforced it.** `n=1` ran one sample and reported probability 1.0 for whatever it picked; `n=-5` produced `total_iterations: -5`. Above the maximum is still clamped; below it, and any non-integer, is refused with the documented error shape.
+- **The goal regex matched the taxonomy word anywhere in the response.** `re.DOTALL` let `.*?` run from the first `<world_model>` to the first taxonomy word anywhere in the cleaned text, so prose or an echoed question set the goal stored in Mnemosyne. Detection now reads the extracted block the formatter already produces, and only accepts a goal statement, so a bare word records `unknown`.
+- **The settings singleton was written without a lock.** `/_doga` mutated global settings from whichever thread, and `_last_jev_status` was one process-wide slot, so concurrent sessions raced and a `/doga status` on a quiet session reported another session's outcome. The mode state is a locked read-modify-write, the slash commands commit as one locked change, and the status is per turn.
+- **Raising `max_recursion` did not clear the stop latch it had tripped**, so a raised limit took effect only on the next turn. The latch and its count are cleared when the limit changes.
+- **A pinned provider survived into a mode that did not use it**, and came back silently on the next API-led selection. The pin is dropped when the mode resolves to no hosted provider, and the resolved provider is named in every reply and in `/doga status`.
+- **`/doga provider clef` reported `api_only` and routed to Jev**: the alias was resolved, then the unqualified canonical name was re-resolved against the old pin before the new one was stored. The pin is applied first now.
+- **Two docs described settings that do not exist.** `local_model()` promised URL-path-segment interpolation; its only consumer is in-process `laya.load(name)`. The README documented a `base_url` setting, which belongs to the Decis project cited beside it, and a "local server URL" this plugin does not have.
+
+### Added
+
+- `tests/test_v160_review_fixes.py`, 32 tests pinning each fix: the goal word outside a block, inside a block, in the stripped guidance, and in an unclosed tag; the iteration minimum, maximum, negative, non-integer, and one-sample cases; a validated rejection escalating instead of reaching the paid fallback, and a transport failure still reaching it; the upstream body appearing in neither the message nor `caplog`; the settings write committing under the lock and per-turn status isolation; the raised limit taking effect in the turn it was raised; and the pin being cleared and named.
+
+## v1.5.0 (2026-10-09)
 ## v1.5.0 (2026-10-09)
 
 Two ways the plugin failed hard on ordinary bad input. Full notes: [RELEASE_NOTES_v1.5.0.md](RELEASE_NOTES_v1.5.0.md).

@@ -116,7 +116,7 @@ The local side is a generic System One decision-model slot. Its configuration na
 
 | Setting | Kind | Default | Purpose |
 | --- | --- | --- | --- |
-| `DOGA_LOCAL_MODEL` | Configuration | `convaiinnovations/laya` | The checkpoint or engine name sent to the local server |
+| `DOGA_LOCAL_MODEL` | Configuration | `convaiinnovations/laya` | The engine name passed to the in-process local runtime |
 
 Select the local side with `local_only` or `local_with_api_fallback`, then point it at an engine:
 
@@ -130,13 +130,13 @@ uv pip install --python /path/to/hermes-python '.[laya]'
 
 If you copied the plugin directory instead of installing the Python package, install `laya>=0.3.20,<1` into Hermes' Python environment. The optional dependency brings PyTorch and Transformers; allow disk space for them and the model checkpoint. The default engine is `convaiinnovations/laya`, loaded once per process and reused; switching `DOGA_LOCAL_MODEL` loads the newly named engine rather than reusing the previous one. Its first load can download weights from Hugging Face and block the first classified request while doing so. Cache the checkpoint before using `HF_HUB_OFFLINE=1` for offline operation. A local smoke test emitted a Laya warning about invalid saved choice temperatures that it clamped; treat affected confidence values as uncalibrated. No Jev keys are needed for `local_only`.
 
-`DOGA_LOCAL_MODEL` is **not** checked against a list of known engines. That is deliberate: the whole point of the slot is that a new local System One decision model works by configuration alone, with no code change. Only a value that could not be used safely is rejected, namely an empty or whitespace-only value, a value containing whitespace, quotes, a backslash, a control character, or a URL separator, and a `.` or `..` path segment. System One decision models known to speak the same `/v1/systemone` contract and therefore fit this slot:
+`DOGA_LOCAL_MODEL` is **not** checked against a list of known engines. That is deliberate: the whole point of the slot is that a new local System One decision model works by configuration alone, with no code change. Only a value that could not be used safely is rejected: the name is handed to `laya.load(name)` inside the Hermes process and is split on `/` first, so a value containing whitespace, quotes, a backslash, a control character, or a `.` or `..` segment is refused rather than loaded. There is no local server URL and no request body in this path, so neither is a thing the setting has to be safe against. System One decision models known to speak the same `/v1/systemone` contract and therefore fit this slot:
 
 | Engine | Note |
 | --- | --- |
 | `laya` | Convai Innovations. Also `laya-multilingual` and `laya-typed-decisions`. The default. Any of Laya or other pre-deterministic routing models can occupy the slot |
 
-Listing an engine here is a documented claim from its own project that it speaks the shared contract; it is not a measurement made in this repository. For the interchangeable-engine claim, see [chaitin/Decis](https://github.com/chaitin/Decis), which is self-hosted, serves the shared `/v1/systemone` contract that Jev's TypeSafe route also uses, and ships one Docker image per engine, so swapping `base_url` is the whole migration. Any of Laya or other pre-deterministic routing models can occupy the slot that way. A local server URL remains its own setting; pointing DOGA at a different engine's server is a configuration change, not a code change. An unrecognised mode name fails closed to ordinary guidance rather than reaching for the API.
+Listing an engine here is a documented claim from its own project that it speaks the shared contract; it is not a measurement made in this repository. That project's self-hosted servers are interchangeable by swapping their own `base_url`, which is a setting of that project and not of this plugin: DOGA loads the local engine in-process through `laya.load(name)`, so it has no server URL to point. What DOGA configures is the engine name, so occupying the slot with another engine is one environment value. An unrecognised mode name fails closed to ordinary guidance rather than reaching for the API.
 
 ### Cloudflare Clef setup
 
