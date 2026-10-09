@@ -12,9 +12,23 @@ from typing import Optional
 from . import de_bono_hats
 
 
-# Regex to find <world_model>...</world_model> blocks
+# Regex to find <world_model>...</world_model> blocks.
+#
+# Neither side of the capture carries `\s*`. The previous form was
+# `<world_model>\s*(.*?)\s*</world_model>`, and on an unclosed tag — a truncated
+# LLM response, a model that opened the block and stopped — the engine retried
+# the greedy whitespace prefix from every offset. That reads linear and is not:
+# measured on a whitespace run after an unclosed tag, 400 sp = 39 ms,
+# 800 sp = 310 ms, 1600 sp = 2.42 s, 3200 sp = 18.7 s, eight for one doubling.
+# The same lengths with letters cost 0.01–0.08 ms. This runs on every assistant
+# response, so one malformed reply was an 18-second hang.
+#
+# Dropping both is behaviour-preserving for the block itself: line 52 already
+# strips the captured text, so the surrounding whitespace never reached a
+# caller. With them gone the same 3,200-space input costs 0.14 ms and the
+# captured groups are identical.
 _WORLD_MODEL_RE = re.compile(
-    r"<world_model>\s*(.*?)\s*</world_model>",
+    r"<world_model>(.*?)</world_model>",
     re.DOTALL | re.IGNORECASE,
 )
 
